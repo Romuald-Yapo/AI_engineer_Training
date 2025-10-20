@@ -28,6 +28,53 @@ CREATE TABLE IF NOT EXISTS pipelines (
     CHECK (ensemble_enabled = 0 OR ensemble_size >= 2)
 );
 
+CREATE TABLE IF NOT EXISTS models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    identifier TEXT NOT NULL,
+    temperature REAL NOT NULL DEFAULT 0.7,
+    top_p REAL NOT NULL DEFAULT 0.95,
+    top_k INTEGER NOT NULL DEFAULT 40,
+    num_ctx INTEGER NOT NULL DEFAULT 4096,
+    max_output INTEGER NOT NULL DEFAULT 1024,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_models_identifier
+    ON models (identifier);
+
+CREATE TRIGGER IF NOT EXISTS trg_models_touch_timestamp
+AFTER UPDATE ON models
+FOR EACH ROW
+WHEN NEW.updated_at <= OLD.updated_at
+BEGIN
+    UPDATE models
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id = NEW.id;
+END;
+
+CREATE TABLE IF NOT EXISTS prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    type TEXT NOT NULL CHECK (type IN ('clinical', 'technical')),
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prompts_touch_timestamp
+AFTER UPDATE ON prompts
+FOR EACH ROW
+WHEN NEW.updated_at <= OLD.updated_at
+BEGIN
+    UPDATE prompts
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id = NEW.id;
+END;
+
 CREATE TABLE IF NOT EXISTS pipeline_models (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     pipeline_id INTEGER NOT NULL,

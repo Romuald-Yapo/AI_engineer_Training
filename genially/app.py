@@ -11,11 +11,12 @@ st.set_page_config(page_title="LLM Medical Pipeline Configuration", layout="wide
 MODEL_DEFAULTS = {
     "name": "",
     "description": "",
-    "provider": "anthropic",
     "model": "",
     "temperature": 0.7,
-    "max_tokens": 2048,
-    "top_p": 1.0,
+    "top_p": 0.95,
+    "top_k": 40,
+    "num_ctx": 4096,
+    "max_output": 1024,
 }
 
 PROMPT_DEFAULTS = {
@@ -81,10 +82,14 @@ def load_pipelines_from_db() -> list[dict]:
         model_rows = conn.execute(
             """
             SELECT
-                pipeline_id,
-                model_id
-            FROM pipeline_models
-            ORDER BY pipeline_id, step_order
+                pm.pipeline_id,
+                pm.model_id,
+                pm.step_order
+            FROM pipeline_models AS pm
+            LEFT JOIN models AS m
+              ON m.id = pm.model_id
+            WHERE m.id IS NOT NULL
+            ORDER BY pm.pipeline_id, pm.step_order
             """
         ).fetchall()
 
@@ -122,6 +127,225 @@ def load_pipelines_from_db() -> list[dict]:
         )
 
     return pipelines
+
+
+def load_models_from_db() -> list[dict]:
+    if not DB_PATH.exists():
+        return []
+
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                name,
+                description,
+                identifier,
+                temperature,
+                top_p,
+                top_k,
+                num_ctx,
+                max_output
+            FROM models
+            ORDER BY id
+            """
+        ).fetchall()
+
+    models: list[dict] = []
+    for row in rows:
+        models.append(
+            {
+                "id": row["id"],
+                "name": row["name"] or "",
+                "description": row["description"] or "",
+                "model": row["identifier"] or "",
+                "temperature": float(row["temperature"]) if row["temperature"] is not None else 0.7,
+                "top_p": float(row["top_p"]) if row["top_p"] is not None else 0.95,
+                "top_k": int(row["top_k"]) if row["top_k"] is not None else 40,
+                "num_ctx": int(row["num_ctx"]) if row["num_ctx"] is not None else 4096,
+                "max_output": int(row["max_output"]) if row["max_output"] is not None else 1024,
+            }
+        )
+    return models
+
+
+def sync_models_from_db(state: st.session_state) -> None:
+    try:
+        models = load_models_from_db()
+        state.model_db_error = ""
+    except sqlite3.Error as exc:
+        models = []
+        state.model_db_error = f"Database error while loading models: {exc}"
+    state.models = models
+
+
+def persist_model_to_db(model: dict, model_id: int | None = None) -> int:
+    payload = (
+        model["name"],
+        model.get("description", ""),
+        model["model"],
+        float(model.get("temperature", 0.7)),
+        float(model.get("top_p", 0.95)),
+        int(model.get("top_k", 40)),
+        int(model.get("num_ctx", 4096)),
+        int(model.get("max_output", 1024)),
+    )
+
+    with get_db_connection() as conn:
+        if model_id is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO models (
+                    name,
+                    description,
+                    identifier,
+                    temperature,
+                    top_p,
+                    top_k,
+                    num_ctx,
+                    max_output
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
+            )
+            model_id = cursor.lastrowid
+        else:
+            conn.execute(
+                """
+                UPDATE models
+                SET
+                    name = ?,
+                    description = ?,
+                    identifier = ?,
+                    temperature = ?,
+                    top_p = ?,
+                    top_k = ?,
+                    num_ctx = ?,
+                    max_output = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?
+                """,
+                payload + (model_id,),
+            )
+    return model_id
+
+
+def delete_model_from_db(model_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM pipeline_models WHERE model_id = ?", (model_id,))
+        conn.execute(
+            """
+            UPDATE pipelines
+            SET
+                judge_model_id = NULL,
+                llm_as_judge = 0,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE judge_model_id = ?
+            """,
+            (model_id,),
+        )
+        conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
+
+
+def load_prompts_from_db() -> list[dict]:
+    if not DB_PATH.exists():
+        return []
+
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                name,
+                description,
+                type,
+                content
+            FROM prompts
+            ORDER BY id
+            """
+        ).fetchall()
+
+    prompts: list[dict] = []
+    for row in rows:
+        prompts.append(
+            {
+                "id": row["id"],
+                "name": row["name"] or "",
+                "description": row["description"] or "",
+                "type": row["type"],
+                "content": row["content"] or "",
+            }
+        )
+    return prompts
+
+
+def sync_prompts_from_db(state: st.session_state) -> None:
+    try:
+        prompts = load_prompts_from_db()
+        state.prompt_db_error = ""
+    except sqlite3.Error as exc:
+        prompts = []
+        state.prompt_db_error = f"Database error while loading prompts: {exc}"
+    state.prompts = prompts
+
+
+def persist_prompt_to_db(prompt: dict, prompt_id: int | None = None) -> int:
+    payload = (
+        prompt["name"],
+        prompt.get("description", ""),
+        prompt["type"],
+        prompt["content"],
+    )
+
+    with get_db_connection() as conn:
+        if prompt_id is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO prompts (
+                    name,
+                    description,
+                    type,
+                    content
+                ) VALUES (?, ?, ?, ?)
+                """,
+                payload,
+            )
+            prompt_id = cursor.lastrowid
+        else:
+            conn.execute(
+                """
+                UPDATE prompts
+                SET
+                    name = ?,
+                    description = ?,
+                    type = ?,
+                    content = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?
+                """,
+                payload + (prompt_id,),
+            )
+    return prompt_id
+
+
+def delete_prompt_from_db(prompt_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE pipelines
+            SET
+                technical_prompt_id = CASE WHEN technical_prompt_id = ? THEN NULL ELSE technical_prompt_id END,
+                clinical_prompt_id = CASE WHEN clinical_prompt_id = ? THEN NULL ELSE clinical_prompt_id END,
+                updated_at = CASE
+                    WHEN technical_prompt_id = ? OR clinical_prompt_id = ?
+                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ELSE updated_at
+                END
+            WHERE technical_prompt_id = ? OR clinical_prompt_id = ?
+            """,
+            (prompt_id, prompt_id, prompt_id, prompt_id, prompt_id, prompt_id),
+        )
+        conn.execute("DELETE FROM prompts WHERE id = ?", (prompt_id,))
 
 
 def sync_pipelines_from_db(state: st.session_state) -> None:
@@ -244,13 +468,18 @@ def count_enabled_strategies(anti: dict) -> int:
 
 def reset_model_form_fields(state: st.session_state, data: dict | None = None) -> None:
     payload = {**MODEL_DEFAULTS, **(data or {})}
+    if data:
+        legacy_max_tokens = data.get("max_tokens")
+        if legacy_max_tokens is not None and not data.get("max_output"):
+            payload["max_output"] = legacy_max_tokens
     state.model_form_name = payload["name"]
     state.model_form_description = payload["description"]
-    state.model_form_provider = payload["provider"]
     state.model_form_model = payload["model"]
     state.model_form_temperature = float(payload["temperature"])
-    state.model_form_max_tokens = int(payload["max_tokens"]) if payload["max_tokens"] else 1
     state.model_form_top_p = float(payload["top_p"])
+    state.model_form_top_k = int(payload["top_k"])
+    state.model_form_num_ctx = int(payload["num_ctx"])
+    state.model_form_max_output = int(payload["max_output"])
 
 
 def reset_prompt_form_fields(state: st.session_state, data: dict | None = None) -> None:
@@ -297,30 +526,50 @@ def reset_pipeline_form_fields(state: st.session_state, data: dict | None = None
 def ensure_session_state() -> None:
     state = st.session_state
 
-    if "models" not in state:
-        state.models = []
-    if "model_id_counter" not in state:
-        state.model_id_counter = 1
+    state.models = state.get("models", [])
     if "model_edit_id" not in state:
         state.model_edit_id = None
     if "show_model_form" not in state:
         state.show_model_form = False
     if "model_form_error" not in state:
         state.model_form_error = ""
-    if "model_form_name" not in state:
+    if "model_db_error" not in state:
+        state.model_db_error = ""
+    if "models_loaded" not in state:
+        sync_models_from_db(state)
+        state.models_loaded = True
+    model_form_keys = [
+        "model_form_name",
+        "model_form_description",
+        "model_form_model",
+        "model_form_temperature",
+        "model_form_top_p",
+        "model_form_top_k",
+        "model_form_num_ctx",
+        "model_form_max_output",
+    ]
+    if any(key not in state for key in model_form_keys):
         reset_model_form_fields(state)
 
-    if "prompts" not in state:
-        state.prompts = []
-    if "prompt_id_counter" not in state:
-        state.prompt_id_counter = 1
+    state.prompts = state.get("prompts", [])
     if "prompt_edit_id" not in state:
         state.prompt_edit_id = None
     if "show_prompt_form" not in state:
         state.show_prompt_form = False
     if "prompt_form_error" not in state:
         state.prompt_form_error = ""
-    if "prompt_form_name" not in state:
+    if "prompt_db_error" not in state:
+        state.prompt_db_error = ""
+    if "prompts_loaded" not in state:
+        sync_prompts_from_db(state)
+        state.prompts_loaded = True
+    prompt_form_keys = [
+        "prompt_form_name",
+        "prompt_form_description",
+        "prompt_form_type",
+        "prompt_form_content",
+    ]
+    if any(key not in state for key in prompt_form_keys):
         reset_prompt_form_fields(state)
 
     if "pipelines" not in state:
@@ -392,7 +641,8 @@ def sanitize_pipeline_state() -> None:
 def get_model_label(model_id: int) -> str:
     for model in st.session_state.models:
         if model["id"] == model_id:
-            return f"{model['name']} ({model['provider']}/{model['model'] or 'n/a'})"
+            identifier = model.get("model") or "n/a"
+            return f"{model.get('name', 'Unnamed')} ({identifier})"
     return "Unknown model"
 
 
@@ -425,7 +675,15 @@ def edit_model(model_id: int) -> None:
 
 def delete_model(model_id: int) -> None:
     state = st.session_state
-    state.models = [m for m in state.models if m["id"] != model_id]
+    try:
+        delete_model_from_db(model_id)
+        state.model_form_error = ""
+    except sqlite3.Error as exc:
+        state.model_form_error = f"Failed to delete model: {exc}"
+        return
+
+    sync_models_from_db(state)
+    sync_pipelines_from_db(state)
     sanitize_pipeline_state()
     if state.model_edit_id == model_id:
         cancel_model_form()
@@ -444,11 +702,12 @@ def collect_model_form_data() -> dict:
     return {
         "name": state.model_form_name.strip(),
         "description": state.model_form_description.strip(),
-        "provider": state.model_form_provider,
         "model": state.model_form_model.strip(),
         "temperature": float(state.model_form_temperature),
-        "max_tokens": int(state.model_form_max_tokens),
         "top_p": float(state.model_form_top_p),
+        "top_k": int(state.model_form_top_k),
+        "num_ctx": int(state.model_form_num_ctx),
+        "max_output": int(state.model_form_max_output),
     }
 
 
@@ -458,18 +717,22 @@ def save_model_form() -> None:
     if not data["name"]:
         state.model_form_error = "Model name is required."
         return
+    if not data["model"]:
+        state.model_form_error = "Model identifier is required."
+        return
     state.model_form_error = ""
 
-    if state.model_edit_id is not None:
-        updated = {"id": state.model_edit_id, **data}
-        state.models = [
-            updated if model["id"] == state.model_edit_id else model for model in state.models
-        ]
-    else:
-        new_model = {"id": state.model_id_counter, **data}
-        state.model_id_counter += 1
-        state.models.append(new_model)
+    try:
+        target_id = state.model_edit_id
+        model_id = persist_model_to_db(data, target_id)
+    except sqlite3.Error as exc:
+        state.model_form_error = f"Failed to save model: {exc}"
+        return
 
+    data["id"] = model_id
+    sync_models_from_db(state)
+    sync_pipelines_from_db(state)
+    sanitize_pipeline_state()
     cancel_model_form()
 
 
@@ -493,7 +756,15 @@ def edit_prompt(prompt_id: int) -> None:
 
 def delete_prompt(prompt_id: int) -> None:
     state = st.session_state
-    state.prompts = [p for p in state.prompts if p["id"] != prompt_id]
+    try:
+        delete_prompt_from_db(prompt_id)
+        state.prompt_form_error = ""
+    except sqlite3.Error as exc:
+        state.prompt_form_error = f"Failed to delete prompt: {exc}"
+        return
+
+    sync_prompts_from_db(state)
+    sync_pipelines_from_db(state)
     sanitize_pipeline_state()
     if state.prompt_edit_id == prompt_id:
         cancel_prompt_form()
@@ -528,16 +799,17 @@ def save_prompt_form() -> None:
         return
     state.prompt_form_error = ""
 
-    if state.prompt_edit_id is not None:
-        updated = {"id": state.prompt_edit_id, **data}
-        state.prompts = [
-            updated if prompt["id"] == state.prompt_edit_id else prompt for prompt in state.prompts
-        ]
-    else:
-        new_prompt = {"id": state.prompt_id_counter, **data}
-        state.prompt_id_counter += 1
-        state.prompts.append(new_prompt)
+    try:
+        target_id = state.prompt_edit_id
+        prompt_id = persist_prompt_to_db(data, target_id)
+    except sqlite3.Error as exc:
+        state.prompt_form_error = f"Failed to save prompt: {exc}"
+        return
 
+    data["id"] = prompt_id
+    sync_prompts_from_db(state)
+    sync_pipelines_from_db(state)
+    sanitize_pipeline_state()
     cancel_prompt_form()
 
 
@@ -711,6 +983,9 @@ def render_models_tab() -> None:
     with header_cols[1]:
         st.button("New model", on_click=start_new_model, type="primary", use_container_width=True)
 
+    if st.session_state.model_db_error:
+        st.error(st.session_state.model_db_error)
+
     if st.session_state.show_model_form:
         header = "Edit model" if st.session_state.model_edit_id is not None else "New model"
         with st.container():
@@ -719,7 +994,11 @@ def render_models_tab() -> None:
             with form_cols[0]:
                 st.text_input("Name", key="model_form_name")
             with form_cols[1]:
-                st.selectbox("Provider", ["anthropic", "ollama", "openai"], key="model_form_provider")
+                st.text_input(
+                    "Model identifier",
+                    key="model_form_model",
+                    help="Exact Ollama model tag, e.g. `mistral:latest`.",
+                )
 
             st.text_area(
                 "Description",
@@ -727,13 +1006,15 @@ def render_models_tab() -> None:
                 help="Short reminder about latency, pricing, or intended usage.",
             )
 
-            spec_cols = st.columns(2)
-            with spec_cols[0]:
-                st.text_input("Model identifier", key="model_form_model")
-                st.number_input("Max tokens", min_value=1, key="model_form_max_tokens", step=1)
-            with spec_cols[1]:
-                st.slider("Temperature", 0.0, 2.0, key="model_form_temperature", step=0.1)
-                st.slider("Top P", 0.0, 1.0, key="model_form_top_p", step=0.05)
+            param_cols = st.columns(3)
+            with param_cols[0]:
+                st.slider("Temperature", 0.0, 2.0, key="model_form_temperature", step=0.05)
+                st.slider("Top P", 0.0, 1.0, key="model_form_top_p", step=0.01)
+            with param_cols[1]:
+                st.number_input("Top K", min_value=1, key="model_form_top_k", step=1)
+                st.number_input("Context window (num_ctx)", min_value=1, key="model_form_num_ctx", step=128)
+            with param_cols[2]:
+                st.number_input("Max output tokens", min_value=1, key="model_form_max_output", step=16)
 
             if st.session_state.model_form_error:
                 st.error(st.session_state.model_form_error)
@@ -744,19 +1025,34 @@ def render_models_tab() -> None:
 
     if st.session_state.models:
         st.markdown("### Saved models")
-        for model in st.session_state.models:
+        models = st.session_state.models
+        for idx, model in enumerate(models):
             with st.container():
                 cols = st.columns([6, 1, 1])
                 cols[0].markdown(f"**{model['name']}**  \n{model['description'] or 'No description'}")
+                identifier = model.get("model") or "n/a"
+                temperature = model.get("temperature")
+                top_p = model.get("top_p")
+                top_k = model.get("top_k")
+                num_ctx = model.get("num_ctx")
+                max_output = model.get("max_output")
+                temperature_display = f"{temperature:.2f}" if isinstance(temperature, (int, float)) else "n/a"
+                top_p_display = f"{top_p:.2f}" if isinstance(top_p, (int, float)) else "n/a"
+                top_k_display = f"{top_k}" if isinstance(top_k, (int, float)) else "n/a"
+                num_ctx_display = f"{num_ctx}" if isinstance(num_ctx, (int, float)) else "n/a"
+                max_output_display = f"{max_output}" if isinstance(max_output, (int, float)) else "n/a"
                 cols[0].write(
-                    f"- Provider: `{model['provider']}`\n"
-                    f"- Identifier: `{model['model'] or 'n/a'}`\n"
-                    f"- Temperature: {model['temperature']}\n"
-                    f"- Top P: {model['top_p']}\n"
-                    f"- Max tokens: {model['max_tokens']}"
+                    f"- Identifier: `{identifier}`\n"
+                    f"- Temperature: {temperature_display}\n"
+                    f"- Top P: {top_p_display}\n"
+                    f"- Top K: {top_k_display}\n"
+                    f"- Context window (num_ctx): {num_ctx_display}\n"
+                    f"- Max output tokens: {max_output_display}"
                 )
                 cols[1].button("Edit", key=f"edit_model_{model['id']}", on_click=edit_model, args=(model["id"],))
                 cols[2].button("Delete", key=f"delete_model_{model['id']}", on_click=delete_model, args=(model["id"],))
+            if idx < len(models) - 1:
+                st.divider()
     else:
         st.info("No models configured yet. Use *New model* to add one.")
 
@@ -768,6 +1064,9 @@ def render_prompts_tab() -> None:
         st.write("Store reusable prompt templates for clinical extraction and technical formatting.")
     with header_cols[1]:
         st.button("New prompt", on_click=start_new_prompt, type="primary", use_container_width=True)
+
+    if st.session_state.prompt_db_error:
+        st.error(st.session_state.prompt_db_error)
 
     if st.session_state.show_prompt_form:
         header = "Edit prompt" if st.session_state.prompt_edit_id is not None else "New prompt"
@@ -791,7 +1090,8 @@ def render_prompts_tab() -> None:
 
     if st.session_state.prompts:
         st.markdown("### Saved prompts")
-        for prompt in st.session_state.prompts:
+        prompts = st.session_state.prompts
+        for idx, prompt in enumerate(prompts):
             with st.container():
                 cols = st.columns([6, 1, 1])
                 badge = "Clinical" if prompt["type"] == "clinical" else "Technical"
@@ -800,6 +1100,8 @@ def render_prompts_tab() -> None:
                 cols[0].code(prompt["content"], language="markdown")
                 cols[1].button("Edit", key=f"edit_prompt_{prompt['id']}", on_click=edit_prompt, args=(prompt["id"],))
                 cols[2].button("Delete", key=f"delete_prompt_{prompt['id']}", on_click=delete_prompt, args=(prompt["id"],))
+            if idx < len(prompts) - 1:
+                st.divider()
     else:
         st.info("No prompts configured yet. Use *New prompt* to add one.")
 
@@ -886,12 +1188,16 @@ def render_pipeline_summary(pipeline: dict) -> None:
     cols[2].metric("Clinical prompt", "Yes" if pipeline["clinical_prompt"] else "No")
     cols[3].metric("Technical prompt", "Yes" if pipeline["technical_prompt"] else "No")
 
+    st.divider()
+
     detail_cols = st.columns(2)
     with detail_cols[0]:
         st.write(f"**Name:** {pipeline['name'] or 'Unnamed pipeline'}")
         st.write(f"**Description:** {pipeline['description'] or 'No description'}")
     with detail_cols[1]:
         st.write(f"**Data source:** {pipeline['data_source'] or 'Not specified'}")
+
+    st.divider()
 
     st.markdown("#### Prompts")
     prompt_cols = st.columns(2)
@@ -902,6 +1208,8 @@ def render_pipeline_summary(pipeline: dict) -> None:
         st.markdown("**Technical**")
         st.write(get_prompt_label(pipeline["technical_prompt"]) if pipeline["technical_prompt"] else "None")
 
+    st.divider()
+
     st.markdown("#### Execution setup")
     execution_cols = st.columns(2)
     with execution_cols[0]:
@@ -911,6 +1219,25 @@ def render_pipeline_summary(pipeline: dict) -> None:
                 st.write(f"{index}. {get_model_label(model_id)}")
         else:
             st.write("No models selected.")
+
+    with execution_cols[1]:
+        st.markdown("**Anti-hallucination**")
+        anti = pipeline["anti_hallucination"]
+
+        strategies = []
+        if anti["ensemble"]:
+            strategies.append(f"- Ensemble enabled with size {anti['ensemble_size']}")
+        if anti["chain_of_verification"]:
+            strategies.append("- Chain-of-verification checks enabled")
+        if anti["contextual_grounding"]:
+            strategies.append("- Contextual grounding active")
+        if anti["llm_as_judge"]:
+            judge = get_model_label(anti["judge_model"]) if anti["judge_model"] else "No judge selected"
+            strategies.append(f"- LLM-as-a-judge with {judge}")
+        if not strategies:
+            strategies.append("No additional strategies selected.")
+
+        st.markdown("\n".join(strategies))
 
     with execution_cols[1]:
         st.markdown("**Anti-hallucination**")
@@ -946,7 +1273,8 @@ def render_pipeline_tab() -> None:
 
     if st.session_state.pipelines:
         st.markdown("### Saved pipelines")
-        for pipeline in st.session_state.pipelines:
+        pipelines = st.session_state.pipelines
+        for idx, pipeline in enumerate(pipelines):
             with st.container():
                 cols = st.columns([5, 1, 1, 1])
                 cols[0].markdown(f"**{pipeline['name']}**  \n{pipeline['description'] or 'No description'}")
@@ -957,6 +1285,8 @@ def render_pipeline_tab() -> None:
                 cols[1].button("Load", key=f"load_pipeline_{pipeline['id']}", on_click=load_pipeline, args=(pipeline["id"],))
                 cols[2].button("Edit", key=f"edit_pipeline_{pipeline['id']}", on_click=edit_pipeline, args=(pipeline["id"],))
                 cols[3].button("Delete", key=f"delete_pipeline_{pipeline['id']}", on_click=delete_pipeline, args=(pipeline["id"],))
+            if idx < len(pipelines) - 1:
+                st.divider()
     else:
         st.info("No pipelines saved yet.")
 
