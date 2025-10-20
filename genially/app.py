@@ -1,5 +1,10 @@
-import streamlit as st
+import sqlite3
 from copy import deepcopy
+from pathlib import Path
+
+import streamlit as st
+
+from initialize_pipeline_db import DB_FILENAME, SCHEMA, ensure_database
 
 st.set_page_config(page_title="LLM Medical Pipeline Configuration", layout="wide")
 
@@ -35,6 +40,207 @@ PIPELINE_DEFAULTS = {
     "judge_model": None,
 }
 
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / DB_FILENAME
+
+if not DB_PATH.exists():
+    ensure_database(DB_PATH, SCHEMA)
+
+
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_pipelines_from_db() -> list[dict]:
+    if not DB_PATH.exists():
+        return []
+
+    with get_db_connection() as conn:
+        pipeline_rows = conn.execute(
+            """
+            SELECT
+                id,
+                name,
+                description,
+                data_source,
+                technical_prompt_id,
+                clinical_prompt_id,
+                ensemble_enabled,
+                ensemble_size,
+                chain_of_verification,
+                contextual_grounding,
+                llm_as_judge,
+                judge_model_id
+            FROM pipelines
+            ORDER BY id
+            """
+        ).fetchall()
+
+        model_rows = conn.execute(
+            """
+            SELECT
+                pipeline_id,
+                model_id
+            FROM pipeline_models
+            ORDER BY pipeline_id, step_order
+            """
+        ).fetchall()
+
+    models_by_pipeline: dict[int, list[int]] = {}
+    for row in model_rows:
+        models_by_pipeline.setdefault(row["pipeline_id"], []).append(row["model_id"])
+
+    pipelines: list[dict] = []
+    for row in pipeline_rows:
+        anti = {
+            "ensemble": bool(row["ensemble_enabled"]),
+            "ensemble_size": row["ensemble_size"],
+            "chain_of_verification": bool(row["chain_of_verification"]),
+            "contextual_grounding": bool(row["contextual_grounding"]),
+            "llm_as_judge": bool(row["llm_as_judge"]),
+            "judge_model": row["judge_model_id"],
+        }
+        anti["ensembleSize"] = anti["ensemble_size"]
+        anti["chainOfVerification"] = anti["chain_of_verification"]
+        anti["contextualGrounding"] = anti["contextual_grounding"]
+        anti["llmAsJudge"] = anti["llm_as_judge"]
+        anti["judgeModel"] = anti["judge_model"]
+
+        pipelines.append(
+            {
+                "id": row["id"],
+                "name": row["name"] or "",
+                "description": row["description"] or "",
+                "data_source": row["data_source"] or "",
+                "selected_models": models_by_pipeline.get(row["id"], []),
+                "technical_prompt": row["technical_prompt_id"],
+                "clinical_prompt": row["clinical_prompt_id"],
+                "anti_hallucination": anti,
+            }
+        )
+
+    return pipelines
+
+
+def sync_pipelines_from_db(state: st.session_state) -> None:
+    try:
+        pipelines = load_pipelines_from_db()
+        state.pipeline_db_error = ""
+    except sqlite3.Error as exc:
+        pipelines = []
+        state.pipeline_db_error = f"Database error: {exc}"
+
+    state.pipelines = pipelines
+    state.pipeline_id_counter = max((p["id"] for p in pipelines), default=0) + 1
+
+
+def persist_pipeline_to_db(pipeline: dict, pipeline_id: int | None = None) -> int:
+    anti = pipeline["anti_hallucination"]
+    ensemble_flag = bool(anti.get("ensemble", anti.get("ensembleSize", False)))
+    ensemble_size = int(
+        anti.get("ensemble_size", anti.get("ensembleSize", PIPELINE_DEFAULTS["ensemble_size"]))
+        or PIPELINE_DEFAULTS["ensemble_size"]
+    )
+    if ensemble_flag:
+        ensemble_size = max(ensemble_size, 2)
+
+    chain_flag = bool(anti.get("chain_of_verification", anti.get("chainOfVerification", False)))
+    grounding_flag = bool(anti.get("contextual_grounding", anti.get("contextualGrounding", False)))
+    judge_flag = bool(anti.get("llm_as_judge", anti.get("llmAsJudge", False)))
+    judge_model = anti.get("judge_model", anti.get("judgeModel"))
+
+    payload = (
+        pipeline["name"],
+        pipeline["description"],
+        pipeline["data_source"],
+        pipeline.get("technical_prompt"),
+        pipeline.get("clinical_prompt"),
+        int(ensemble_flag),
+        ensemble_size,
+        int(chain_flag),
+        int(grounding_flag),
+        int(judge_flag),
+        judge_model,
+    )
+
+    with get_db_connection() as conn:
+        if pipeline_id is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO pipelines (
+                    name,
+                    description,
+                    data_source,
+                    technical_prompt_id,
+                    clinical_prompt_id,
+                    ensemble_enabled,
+                    ensemble_size,
+                    chain_of_verification,
+                    contextual_grounding,
+                    llm_as_judge,
+                    judge_model_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
+            )
+            pipeline_id = cursor.lastrowid
+        else:
+            conn.execute(
+                """
+                UPDATE pipelines
+                SET
+                    name = ?,
+                    description = ?,
+                    data_source = ?,
+                    technical_prompt_id = ?,
+                    clinical_prompt_id = ?,
+                    ensemble_enabled = ?,
+                    ensemble_size = ?,
+                    chain_of_verification = ?,
+                    contextual_grounding = ?,
+                    llm_as_judge = ?,
+                    judge_model_id = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?
+                """,
+                payload + (pipeline_id,),
+            )
+            conn.execute(
+                "DELETE FROM pipeline_models WHERE pipeline_id = ?",
+                (pipeline_id,),
+            )
+
+        steps = [
+            (pipeline_id, int(model_id), order)
+            for order, model_id in enumerate(pipeline["selected_models"], start=1)
+        ]
+        if steps:
+            conn.executemany(
+                """
+                INSERT INTO pipeline_models (pipeline_id, model_id, step_order)
+                VALUES (?, ?, ?)
+                """,
+                steps,
+            )
+
+    return pipeline_id
+
+
+def delete_pipeline_from_db(pipeline_id: int) -> None:
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM pipelines WHERE id = ?", (pipeline_id,))
+
+
+def count_enabled_strategies(anti: dict) -> int:
+    strategy_keys = (
+        ("ensemble", "ensembleSize"),
+        ("chain_of_verification", "chainOfVerification"),
+        ("contextual_grounding", "contextualGrounding"),
+        ("llm_as_judge", "llmAsJudge"),
+    )
+    return sum(1 for snake, camel in strategy_keys if anti.get(snake) or anti.get(camel))
 
 def reset_model_form_fields(state: st.session_state, data: dict | None = None) -> None:
     payload = {**MODEL_DEFAULTS, **(data or {})}
@@ -129,6 +335,11 @@ def ensure_session_state() -> None:
         state.pipeline_form_error = ""
     if "current_pipeline_id" not in state:
         state.current_pipeline_id = None
+    if "pipeline_db_error" not in state:
+        state.pipeline_db_error = ""
+    if "pipelines_loaded" not in state:
+        sync_pipelines_from_db(state)
+        state.pipelines_loaded = True
     if "pipeline_form_name" not in state:
         reset_pipeline_form_fields(state)
 
@@ -166,6 +377,9 @@ def sanitize_pipeline_state() -> None:
         judge_model = anti.get("judge_model")
         if judge_model not in valid_model_ids:
             anti["judge_model"] = None
+            anti["judgeModel"] = None
+        else:
+            anti["judgeModel"] = judge_model
         pipeline_copy["anti_hallucination"] = anti
         updated_pipelines.append(pipeline_copy)
     state.pipelines = updated_pipelines
@@ -365,7 +579,15 @@ def load_pipeline(pipeline_id: int) -> None:
 
 def delete_pipeline(pipeline_id: int) -> None:
     state = st.session_state
-    state.pipelines = [p for p in state.pipelines if p["id"] != pipeline_id]
+    try:
+        delete_pipeline_from_db(pipeline_id)
+        state.pipeline_form_error = ""
+    except sqlite3.Error as exc:
+        state.pipeline_form_error = f"Failed to delete pipeline: {exc}"
+        return
+
+    sync_pipelines_from_db(state)
+    sanitize_pipeline_state()
     if state.current_pipeline_id == pipeline_id:
         state.current_pipeline_id = None
     if state.pipeline_edit_id == pipeline_id:
@@ -374,6 +596,18 @@ def delete_pipeline(pipeline_id: int) -> None:
 
 def collect_pipeline_form_data(include_id: bool = True) -> dict:
     state = st.session_state
+    ensemble_flag = bool(state.pipeline_form_ensemble)
+    ensemble_size = int(state.pipeline_form_ensemble_size)
+    if ensemble_flag:
+        ensemble_size = max(ensemble_size, 2)
+    chain_flag = bool(state.pipeline_form_chain_of_verification)
+    grounding_flag = bool(state.pipeline_form_contextual_grounding)
+    judge_flag = bool(state.pipeline_form_llm_as_judge)
+    judge_model_id = (
+        int(state.pipeline_form_judge_model)
+        if judge_flag and state.pipeline_form_judge_model is not None
+        else None
+    )
     pipeline = {
         "name": state.pipeline_form_name.strip(),
         "description": state.pipeline_form_description.strip(),
@@ -390,16 +624,17 @@ def collect_pipeline_form_data(include_id: bool = True) -> dict:
             else None
         ),
         "anti_hallucination": {
-            "ensemble": bool(state.pipeline_form_ensemble),
-            "ensembleSize": int(state.pipeline_form_ensemble_size),
-            "chainOfVerification": bool(state.pipeline_form_chain_of_verification),
-            "contextualGrounding": bool(state.pipeline_form_contextual_grounding),
-            "llmAsJudge": bool(state.pipeline_form_llm_as_judge),
-            "judgeModel": (
-                int(state.pipeline_form_judge_model)
-                if state.pipeline_form_llm_as_judge and state.pipeline_form_judge_model is not None
-                else None
-            ),
+            "ensemble": ensemble_flag,
+            "ensemble_size": ensemble_size,
+            "ensembleSize": ensemble_size,
+            "chain_of_verification": chain_flag,
+            "chainOfVerification": chain_flag,
+            "contextual_grounding": grounding_flag,
+            "contextualGrounding": grounding_flag,
+            "llm_as_judge": judge_flag,
+            "llmAsJudge": judge_flag,
+            "judge_model": judge_model_id,
+            "judgeModel": judge_model_id,
         },
     }
     if include_id and st.session_state.pipeline_edit_id is not None:
@@ -419,12 +654,16 @@ def map_pipeline_keys(pipeline: dict) -> dict:
         "technical_prompt": pipeline.get("technical_prompt"),
         "clinical_prompt": pipeline.get("clinical_prompt"),
         "anti_hallucination": {
-            "ensemble": anti.get("ensemble", False) or anti.get("ensemble", False),
-            "ensemble_size": anti.get("ensembleSize", anti.get("ensemble_size", 3)),
-            "chain_of_verification": anti.get("chainOfVerification", anti.get("chain_of_verification", False)),
-            "contextual_grounding": anti.get("contextualGrounding", anti.get("contextual_grounding", False)),
-            "llm_as_judge": anti.get("llmAsJudge", anti.get("llm_as_judge", False)),
-            "judge_model": anti.get("judgeModel", anti.get("judge_model")),
+            "ensemble": bool(anti.get("ensemble", anti.get("ensembleSize", False))),
+            "ensemble_size": anti.get("ensemble_size", anti.get("ensembleSize", PIPELINE_DEFAULTS["ensemble_size"])),
+            "chain_of_verification": bool(
+                anti.get("chain_of_verification", anti.get("chainOfVerification", False))
+            ),
+            "contextual_grounding": bool(
+                anti.get("contextual_grounding", anti.get("contextualGrounding", False))
+            ),
+            "llm_as_judge": bool(anti.get("llm_as_judge", anti.get("llmAsJudge", False))),
+            "judge_model": anti.get("judge_model", anti.get("judgeModel")),
         },
     }
 
@@ -440,17 +679,16 @@ def save_pipeline_form() -> None:
         return
     state.pipeline_form_error = ""
 
-    if state.pipeline_edit_id is not None:
-        pipeline["id"] = state.pipeline_edit_id
-        state.pipelines = [
-            pipeline if existing["id"] == state.pipeline_edit_id else existing
-            for existing in state.pipelines
-        ]
-    else:
-        pipeline["id"] = state.pipeline_id_counter
-        state.pipeline_id_counter += 1
-        state.pipelines.append(pipeline)
+    try:
+        target_id = state.pipeline_edit_id
+        pipeline_id = persist_pipeline_to_db(pipeline, target_id)
+    except sqlite3.Error as exc:
+        state.pipeline_form_error = f"Failed to save pipeline: {exc}"
+        return
 
+    pipeline["id"] = pipeline_id
+    sync_pipelines_from_db(state)
+    sanitize_pipeline_state()
     reset_pipeline_form()
 
 
@@ -703,6 +941,9 @@ def render_pipeline_tab() -> None:
     with header_cols[1]:
         st.button("New pipeline", on_click=start_new_pipeline, type="primary", use_container_width=True)
 
+    if st.session_state.pipeline_db_error:
+        st.error(st.session_state.pipeline_db_error)
+
     if st.session_state.pipelines:
         st.markdown("### Saved pipelines")
         for pipeline in st.session_state.pipelines:
@@ -711,7 +952,7 @@ def render_pipeline_tab() -> None:
                 cols[0].markdown(f"**{pipeline['name']}**  \n{pipeline['description'] or 'No description'}")
                 cols[0].write(
                     f"- Models: {len(pipeline['selected_models'])}  \n"
-                    f"- Strategies: {sum(1 for flag in pipeline['anti_hallucination'].values() if isinstance(flag, bool) and flag)}"
+                    f"- Strategies: {count_enabled_strategies(pipeline['anti_hallucination'])}"
                 )
                 cols[1].button("Load", key=f"load_pipeline_{pipeline['id']}", on_click=load_pipeline, args=(pipeline["id"],))
                 cols[2].button("Edit", key=f"edit_pipeline_{pipeline['id']}", on_click=edit_pipeline, args=(pipeline["id"],))
