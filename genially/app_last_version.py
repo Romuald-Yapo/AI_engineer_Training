@@ -1,12 +1,16 @@
 import sqlite3
 from copy import deepcopy
 from pathlib import Path
-from typing import Callable
+import time
+from collections import defaultdict
 import polars as pl
 import pandas as pd
-import datetime as datetime
+from datetime import datetime
 import json
 import requests
+import plotly.graph_objects as go
+import plotly.express as px
+from io import BytesIO
 
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
@@ -14,22 +18,6 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 from initialize_pipeline_db import DB_FILENAME, SCHEMA, ensure_database
 from display_text import display, highlight_contexts, configure_aggrid
 from llm_extractor_pipeline import build_messages, llm_extractor
-from evaluation_core import (
-    append_dataframe_to_db,
-    build_url,
-    compute_fleiss_kappa_per_concept,
-    compute_gold_coverage,
-    compute_krippendorff_alpha_per_concept,
-    compute_majority_vote,
-    compute_pairwise_kappa,
-    deduplicate_records,
-    ensure_database_schema,
-    fetch_remote_dataset,
-    load_sample_data,
-    load_table_from_db,
-    prepare_llm_metrics,
-    require_columns,
-)
 
 st.set_page_config(page_title="LLM-Based Medical Concept Extraction", layout="wide")
 
@@ -1179,128 +1167,7 @@ def render_raw_output()-> None:
         st.code(state.data_extract["brut_response"][0], language="markdown")
     else :
         st.warning("Aucune tentative d'extraction")
-
-
-def build_pipeline_runtime_config(pipeline_name: str) -> dict | None:
-    """
-    Assemble the prompt and model configuration needed to execute a pipeline.
-    Returns None when the pipeline or its primary model is missing.
-    """
-    if not pipeline_name:
-        return None
-
-    pipelines = load_pipelines_from_db()
-    pipeline = next((p for p in pipelines if p["name"] == pipeline_name), None)
-    if pipeline is None:
-        return None
-
-    model_ids = pipeline.get("selected_models") or []
-    if not model_ids:
-        return None
-
-    models_by_id = {model["id"]: model for model in load_models_from_db()}
-    model_info = models_by_id.get(model_ids[0])
-    if model_info is None:
-        return None
-
-    prompts_by_id = {prompt["id"]: prompt for prompt in load_prompts_from_db()}
-    system_prompt = prompts_by_id.get(pipeline.get("technical_prompt"), {}).get("content", "")
-    user_prompt = prompts_by_id.get(pipeline.get("clinical_prompt"), {}).get("content", "")
-
-    model_config = {
-        "model_version": model_info.get("model"),
-        "temperature": model_info.get("temperature"),
-        "top_p": model_info.get("top_p"),
-        "top_k": model_info.get("top_k"),
-        "num_ctx": model_info.get("num_ctx"),
-        "max_output": model_info.get("max_output"),
-    }
-
-    return {
-        "pipeline": pipeline,
-        "model_config": model_config,
-        "system_prompt": system_prompt or "",
-        "user_prompt": user_prompt or "",
-    }
-
-
-def load_lazy_dataset(path: str, file_format: str) -> pl.LazyFrame:
-    """Return a LazyFrame for the provided dataset path."""
-    dataset_path = Path(path).expanduser()
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset path '{dataset_path}' does not exist.")
-
-    fmt = (file_format or "").lower()
-    if fmt == "parquet":
-        return pl.scan_parquet(str(dataset_path))
-    if fmt == "csv":
-        return pl.scan_csv(str(dataset_path))
-    raise ValueError(f"Unsupported dataset format '{file_format}'.")
-
-
-def run_pipeline_batches(
-    dataset: pl.LazyFrame,
-    pipeline_cfg: dict,
-    batch_size: int,
-    progress_callback: Callable[[int, int], None] | None = None,
-) -> pl.DataFrame:
-    """
-    Execute the configured pipeline over the lazy dataset in batches.
-    A callable can be supplied to receive (processed_rows, total_rows) updates.
-    """
-    if dataset is None:
-        return pl.DataFrame()
-    if pipeline_cfg is None:
-        raise ValueError("Pipeline configuration is required.")
-    if batch_size <= 0:
-        raise ValueError("Batch size must be a positive integer.")
-
-    total_rows_df = dataset.select(pl.len().alias("row_count")).collect()
-    if total_rows_df.is_empty():
-        return pl.DataFrame()
-    total_rows = int(total_rows_df.get_column("row_count")[0])
-    if total_rows == 0:
-        return pl.DataFrame()
-
-    processed = 0
-    outputs: list[pl.DataFrame] = []
-    model_cfg = pipeline_cfg["model_config"]
-    while processed < total_rows:
-        batch_lazy = dataset.slice(processed, batch_size)
-        batch_df = batch_lazy.collect()
-        if batch_df.is_empty():
-            break
-
-        prompts = build_messages(
-            batch_df.lazy(),
-            pipeline_cfg.get("system_prompt", ""),
-            pipeline_cfg.get("user_prompt", ""),
-        )
-        response = llm_extractor(
-            prompts,
-            batch_df.lazy(),
-            model_cfg["model_version"],
-            model_cfg["num_ctx"],
-            model_cfg["max_output"],
-            model_cfg["temperature"],
-            model_cfg["top_p"],
-            model_cfg["top_k"],
-        )
-        if isinstance(response, pl.DataFrame):
-            batch_output = response
-        else:
-            batch_output = pl.from_pandas(response if isinstance(response, pd.DataFrame) else pd.DataFrame(response))
-        outputs.append(batch_output)
-
-        processed += batch_df.height
-        if progress_callback is not None:
-            progress_callback(processed, total_rows)
-
-    if not outputs:
-        return pl.DataFrame()
-
-    return pl.concat(outputs, how="vertical")
-
+    
 def get_available_models() :
     response = requests.get("http://lx181.intra.chu-rennes.fr:11434/api/tags")
     data = response.json()
@@ -1434,7 +1301,7 @@ def render_prompts_tab() -> None:
             with st.container():
                 cols = st.columns([6, 1, 1])
                 badge = "Clinical" if prompt["type"] == "clinical" else "Technical"
-                cols[0].markdown(f"**{prompt['name']}**  |  {badge}")
+                cols[0].markdown(f"**{prompt['name']}** · {badge}")
                 cols[0].write(prompt["description"] or "No description")
                 # Use the main container area for the expander instead of the column
                 with st.expander("Click here to display the prompt"):
@@ -1640,665 +1507,844 @@ def render_pipeline_tab() -> None:
         render_pipeline_summary(preview)
 
 
-def render_pipeline_evaluation_tab() -> None:
-    st.subheader("Pipeline Evaluation Dashboard")
 
-    state = st.session_state
-    defaults = {
-        "eval_data_source": "Sample dataset",
-        "eval_expert_df": None,
-        "eval_llm_df": None,
-        "eval_db_path": "medical_eval.db",
-        "eval_api_base": "",
-        "eval_expert_endpoint": "/expert-annotations",
-        "eval_llm_endpoint": "/llm-predictions",
-        "eval_api_token": "",
-        "eval_remote_format": "json",
-        "eval_test_path": "",
-        "eval_test_format": "parquet",
-        "eval_test_batch_size": 16,
-        "eval_test_pipeline": "",
-        "eval_test_results": None,
+##### Evaluation Tab Functions #####
+
+ANNOTATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS annotations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    n_rows INTEGER NOT NULL,
+    n_cols INTEGER NOT NULL,
+    data_blob BLOB NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+"""
+
+
+def ensure_annotations_table() -> None:
+    """Ensure the annotations table exists alongside the pipeline tables."""
+    with get_db_connection() as conn:
+        conn.executescript(ANNOTATIONS_SCHEMA)
+
+
+def dataframe_to_blob(df: pl.DataFrame) -> bytes:
+    """Serialize a Polars DataFrame into a Parquet blob for storage."""
+    buffer = BytesIO()
+    df.write_parquet(buffer)
+    return buffer.getvalue()
+
+
+def blob_to_dataframe(blob: bytes) -> pl.DataFrame:
+    """Deserialize a Parquet blob back into a Polars DataFrame."""
+    return pl.read_parquet(BytesIO(blob))
+
+
+def reset_annotation_sequence(conn: sqlite3.Connection) -> None:
+    """Align sqlite_sequence with the current max annotation id."""
+    max_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM annotations").fetchone()[0]
+    if max_id == 0:
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'annotations'")
+    else:
+        cursor = conn.execute(
+            "UPDATE sqlite_sequence SET seq = ? WHERE name = 'annotations'",
+            (max_id,),
+        )
+        if cursor.rowcount == 0:
+            conn.execute(
+                "INSERT INTO sqlite_sequence(name, seq) VALUES ('annotations', ?)",
+                (max_id,),
+            )
+
+
+def load_annotations_from_db() -> list[dict]:
+    """Load stored annotations from SQLite."""
+    ensure_annotations_table()
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, filename, timestamp, n_rows, n_cols, data_blob
+            FROM annotations
+            ORDER BY id
+            """
+        ).fetchall()
+
+    annotations: list[dict] = []
+    for row in rows:
+        annotations.append(
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "timestamp": row["timestamp"],
+                "n_rows": row["n_rows"],
+                "n_cols": row["n_cols"],
+                "data": blob_to_dataframe(bytes(row["data_blob"])),
+            }
+        )
+    return annotations
+
+
+# Initialize session state for database
+if "annotations_db" not in st.session_state:
+    st.session_state.annotations_db = []
+
+if "annotations_loaded" not in st.session_state:
+    st.session_state.annotations_db = load_annotations_from_db()
+    st.session_state.annotations_loaded = True
+
+
+def load_csv_file(uploaded_file):
+    """Load CSV file into Polars DataFrame"""
+    try:
+        df = pl.read_csv(uploaded_file)
+        return df
+    except Exception as e:
+        st.error(f"Error loading CSV: {str(e)}")
+        return None
+
+def save_annotation_to_db(df, filename):
+    """Persist an annotation to SQLite and session state."""
+    ensure_annotations_table()
+    timestamp = datetime.now().isoformat()
+    payload = (
+        filename,
+        timestamp,
+        df.height,
+        df.width,
+        sqlite3.Binary(dataframe_to_blob(df)),
+    )
+
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO annotations (filename, timestamp, n_rows, n_cols, data_blob)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            payload,
+        )
+        annotation_id = cursor.lastrowid
+
+    annotation_entry = {
+        "id": annotation_id,
+        "filename": filename,
+        "timestamp": timestamp,
+        "data": df,
+        "n_rows": df.height,
+        "n_cols": df.width,
     }
-    for key, value in defaults.items():
-        state.setdefault(key, value)
+    st.session_state.annotations_db.append(annotation_entry)
+    return annotation_id
 
-    data_options = ["Sample dataset", "Upload CSV files", "External tool/DB"]
-    default_index = (
-        data_options.index(state["eval_data_source"])
-        if state["eval_data_source"] in data_options
-        else 0
+def delete_annotation(annotation_id):
+    """Delete an annotation, resequence IDs, and refresh session cache."""
+    ensure_annotations_table()
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+        conn.execute("UPDATE annotations SET id = id - 1 WHERE id > ?", (annotation_id,))
+        reset_annotation_sequence(conn)
+
+    st.session_state.annotations_db = load_annotations_from_db()
+
+
+def clear_all_annotations():
+    """Remove every annotation from the persistent store and session."""
+    ensure_annotations_table()
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM annotations")
+        reset_annotation_sequence(conn)
+    st.session_state.annotations_db = []
+
+def compute_cohen_kappa_per_concept(df1, df2, id_col, concept_cols):
+    """
+    Compute Cohen's Kappa between two annotators for each medical concept.
+    Each concept column contains binary values (0 or 1).
+    Returns dict of {concept: kappa_score}
+    """
+    # Merge on ID to align reports
+    merged = df1.join(
+        df2, 
+        on=id_col, 
+        how='inner',
+        suffix='_ann2'
     )
-    source = st.selectbox(
-        "Dataset source",
-        data_options,
-        index=default_index,
-    )
-    if source != state["eval_data_source"]:
-        state["eval_expert_df"] = None
-        state["eval_llm_df"] = None
-        state["eval_data_source"] = source
-
-    db_path_input = st.text_input(
-        "Evaluation SQLite path",
-        value=state["eval_db_path"],
-        help="Used to persist fetched annotations and predictions.",
-    )
-    if db_path_input:
-        state["eval_db_path"] = db_path_input
-    db_path = Path(state["eval_db_path"])
-
-    if source == "Sample dataset":
-        expert_df, llm_df = load_sample_data()
-        state["eval_expert_df"] = expert_df
-        state["eval_llm_df"] = llm_df
-
-    elif source == "Upload CSV files":
-        upload_cols = st.columns(2)
-        with upload_cols[0]:
-            uploaded_expert = st.file_uploader(
-                "Expert annotations CSV",
-                type=["csv"],
-                key="eval_expert_upload",
-                help="Columns required: note_id, concept, annotator, label.",
-            )
-        with upload_cols[1]:
-            uploaded_llm = st.file_uploader(
-                "LLM predictions CSV",
-                type=["csv"],
-                key="eval_llm_upload",
-                help="Columns required: note_id, concept, llm, pipeline, prediction.",
-            )
-
-        if uploaded_expert and uploaded_llm:
-            expert_df = pl.read_csv(uploaded_expert)
-            llm_df = pl.read_csv(uploaded_llm)
-            expert_df = expert_df.with_columns(pl.col("label").cast(pl.Int8))
-            llm_df = llm_df.with_columns(pl.col("prediction").cast(pl.Int8))
-            state["eval_expert_df"] = expert_df
-            state["eval_llm_df"] = llm_df
-        elif state["eval_expert_df"] is None or state["eval_llm_df"] is None:
-            st.info("Upload both CSV files to evaluate pipelines.")
-            return
-
-    else:  # External tool/DB
-        ensure_database_schema(db_path)
-        api_cols = st.columns(2)
-        with api_cols[0]:
-            api_base = st.text_input(
-                "API base URL",
-                value=state["eval_api_base"],
-                key="eval_api_base_input",
-            )
-        with api_cols[1]:
-            token = st.text_input(
-                "Bearer/API token",
-                value=state["eval_api_token"],
-                key="eval_api_token_input",
-                type="password",
-            )
-        endpoint_cols = st.columns(2)
-        with endpoint_cols[0]:
-            expert_endpoint = st.text_input(
-                "Expert endpoint",
-                value=state["eval_expert_endpoint"],
-                key="eval_expert_endpoint_input",
-            )
-        with endpoint_cols[1]:
-            llm_endpoint = st.text_input(
-                "LLM endpoint",
-                value=state["eval_llm_endpoint"],
-                key="eval_llm_endpoint_input",
-            )
-        remote_format = st.selectbox(
-            "Remote format",
-            options=["json", "csv"],
-            index=0 if state["eval_remote_format"] == "json" else 1,
-            key="eval_remote_format_select",
-        )
-        state["eval_api_base"] = api_base
-        state["eval_api_token"] = token
-        state["eval_expert_endpoint"] = expert_endpoint
-        state["eval_llm_endpoint"] = llm_endpoint
-        state["eval_remote_format"] = remote_format
-
-        action_cols = st.columns(2)
-        fetch_clicked = action_cols[0].button("Fetch remote data", use_container_width=True)
-        load_clicked = action_cols[1].button("Load from database", use_container_width=True)
-
-        if fetch_clicked:
-            if not api_base or not expert_endpoint or not llm_endpoint:
-                st.error("Provide the base URL and both endpoints before fetching.")
-            else:
-                headers = {"Authorization": f"Bearer {token}"} if token else {}
-                with st.spinner("Downloading datasets from the external tool..."):
-                    try:
-                        expert_remote = fetch_remote_dataset(
-                            build_url(api_base, expert_endpoint),
-                            expected_format=remote_format,
-                            headers=headers,
-                        )
-                        llm_remote = fetch_remote_dataset(
-                            build_url(api_base, llm_endpoint),
-                            expected_format=remote_format,
-                            headers=headers,
-                        )
-
-                        expert_remote = require_columns(
-                            expert_remote,
-                            ["note_id", "concept", "annotator", "label"],
-                            "Expert annotations",
-                        ).with_columns(pl.col("label").cast(pl.Int8))
-                        llm_remote = require_columns(
-                            llm_remote,
-                            ["note_id", "concept", "llm", "pipeline", "prediction"],
-                            "LLM predictions",
-                        ).with_columns(pl.col("prediction").cast(pl.Int8))
-
-                        optional_dtypes = {
-                            "prompt_version": pl.Utf8,
-                            "retriever": pl.Utf8,
-                            "confidence": pl.Float64,
-                            "latency_ms": pl.Float64,
-                        }
-                        for column, dtype in optional_dtypes.items():
-                            if column not in llm_remote.columns:
-                                llm_remote = llm_remote.with_columns(
-                                    pl.lit(None, dtype=dtype).alias(column)
-                                )
-
-                        expert_clean = deduplicate_records(
-                            expert_remote, subset=["note_id", "concept", "annotator"]
-                        )
-                        llm_clean = deduplicate_records(
-                            llm_remote, subset=["note_id", "concept", "llm", "pipeline"]
-                        )
-
-                        append_dataframe_to_db(
-                            expert_remote,
-                            "expert_annotations",
-                            db_path,
-                            source_label="external-download",
-                        )
-                        append_dataframe_to_db(
-                            llm_remote,
-                            "llm_predictions",
-                            db_path,
-                            source_label="external-download",
-                        )
-
-                        state["eval_expert_df"] = expert_clean
-                        state["eval_llm_df"] = llm_clean
-                        st.success(
-                            f"Fetched {expert_clean.height} expert rows and {llm_clean.height} LLM rows."
-                        )
-                    except Exception as exc:
-                        st.error(f"Failed to download data: {exc}")
-
-        if load_clicked:
-            expert_loaded = load_table_from_db("expert_annotations", db_path)
-            llm_loaded = load_table_from_db("llm_predictions", db_path)
-            if expert_loaded.is_empty() or llm_loaded.is_empty():
-                st.warning("No datasets stored in the evaluation database yet.")
-            else:
-                expert_clean = deduplicate_records(
-                    expert_loaded, subset=["note_id", "concept", "annotator"]
-                )
-                llm_clean = deduplicate_records(
-                    llm_loaded, subset=["note_id", "concept", "llm", "pipeline"]
-                )
-                state["eval_expert_df"] = expert_clean
-                state["eval_llm_df"] = llm_clean
-                st.success(
-                    f"Loaded {expert_clean.height} expert rows and {llm_clean.height} prediction rows from the database."
-                )
-
-    expert_df = state.get("eval_expert_df")
-    llm_df = state.get("eval_llm_df")
-    if expert_df is None or llm_df is None:
-        st.info("Provide expert annotations and LLM predictions to view evaluation metrics.")
-        return
-
-    if expert_df.is_empty() or llm_df.is_empty():
-        st.warning("Loaded datasets are empty. Adjust the source or reload data.")
-        return
-
-    concept_options = sorted(expert_df.get_column("concept").unique().to_list())
-    if not concept_options:
-        st.warning("No concepts found in the expert annotations.")
-        return
-
-    llm_options = sorted(llm_df.get_column("llm").unique().to_list())
-    pipeline_options = sorted(llm_df.get_column("pipeline").unique().to_list())
-
-    filter_cols = st.columns(3)
-    selected_concepts = filter_cols[0].multiselect(
-        "Concepts",
-        options=concept_options,
-        default=concept_options,
-        key="eval_filter_concepts",
-    )
-    selected_llms = filter_cols[1].multiselect(
-        "LLMs",
-        options=llm_options,
-        default=llm_options,
-        key="eval_filter_llms",
-    )
-    selected_pipelines = filter_cols[2].multiselect(
-        "Pipelines",
-        options=pipeline_options,
-        default=pipeline_options,
-        key="eval_filter_pipelines",
-    )
-
-    concept_filter = selected_concepts or concept_options
-    llm_filter = selected_llms or llm_options
-    pipeline_filter = selected_pipelines or pipeline_options
-
-    gold = compute_majority_vote(expert_df)
-    pairwise = compute_pairwise_kappa(expert_df, concept_filter)
-    fleiss = compute_fleiss_kappa_per_concept(expert_df, concept_filter)
-    krippendorff = compute_krippendorff_alpha_per_concept(expert_df, concept_filter)
-    coverage = compute_gold_coverage(expert_df, gold, concept_filter)
-    metrics = prepare_llm_metrics(
-        llm_df,
-        gold,
-        concept_filter,
-        llm_filter,
-        pipeline_filter,
-    )
-
-    best_f1 = None
-    if not metrics.empty:
-        f1_summary = metrics.groupby("llm")["f1"].mean()
-        if not f1_summary.empty:
-            best_f1 = f1_summary.max()
-
-    def format_metric(value: float | None, pattern: str) -> str:
-        if value is None or pd.isna(value):
-            return "n/a"
-        return pattern.format(value)
-
-    kappa_mean = pairwise["kappa"].mean() if not pairwise.empty else None
-    alpha_mean = (
-        krippendorff["krippendorff_alpha"].mean()
-        if not krippendorff.empty
-        else None
-    )
-    fleiss_mean = (
-        fleiss["fleiss_kappa"].mean()
-        if not fleiss.empty
-        else None
-    )
-
-    agreement_tab, llm_vs_gold_tab, llm_vs_llm_tab, runner_tab = st.tabs(
-        [
-            "Annotator Agreement",
-            "LLM vs Annotators",
-            "LLM vs LLM",
-            "Test Set Runner",
-        ]
-    )
-
-    with agreement_tab:
-        metric_cols = st.columns(3)
-        metric_cols[0].metric("Mean kappa", format_metric(kappa_mean, "{:.2f}"))
-        metric_cols[1].metric("Mean Fleiss kappa", format_metric(fleiss_mean, "{:.2f}"))
-        metric_cols[2].metric("Krippendorff alpha", format_metric(alpha_mean, "{:.2f}"))
-
-        st.markdown("#### Pairwise kappa by concept")
-        if pairwise.empty:
-            st.info("No overlapping annotations found for the selected concepts.")
+    
+    if merged.height == 0:
+        return {}, 0
+    
+    kappa_scores = {}
+    n = merged.height
+    
+    for concept in concept_cols:
+        col1 = concept
+        col2 = f"{concept}_ann2"
+        
+        if col1 not in merged.columns or col2 not in merged.columns:
+            continue
+        
+        # Calculate observed agreement
+        agreements = (merged[col1] == merged[col2]).sum()
+        observed_agreement = agreements / n
+        
+        # Calculate expected agreement for binary classification
+        # P(both say 1) + P(both say 0)
+        p1_1 = merged[col1].sum() / n  # annotator 1 says 1
+        p2_1 = merged[col2].sum() / n  # annotator 2 says 1
+        p1_0 = 1 - p1_1  # annotator 1 says 0
+        p2_0 = 1 - p2_1  # annotator 2 says 0
+        
+        expected_agreement = (p1_1 * p2_1) + (p1_0 * p2_0)
+        
+        # Cohen's Kappa
+        if expected_agreement == 1:
+            kappa = 1.0
         else:
-            st.dataframe(
-                pairwise.sort_values(["concept", "kappa"], ascending=[True, False])
-                .style.format({"kappa": "{:.3f}", "n_samples": "{:d}"}),
-                use_container_width=True,
-            )
+            kappa = (observed_agreement - expected_agreement) / (1 - expected_agreement)
+        
+        kappa_scores[concept] = kappa
+    
+    return kappa_scores, n
 
-            matrix_source = pd.concat(
-                [
-                    pairwise[["rater_a", "rater_b", "kappa"]],
-                    pairwise.rename(
-                        columns={"rater_a": "rater_b", "rater_b": "rater_a"}
-                    )[["rater_a", "rater_b", "kappa"]],
-                ],
-                ignore_index=True,
-            )
-            if not matrix_source.empty:
-                kappa_matrix = (
-                    matrix_source.pivot_table(
-                        index="rater_a",
-                        columns="rater_b",
-                        values="kappa",
-                        aggfunc="mean",
-                    )
-                    .sort_index()
-                    .sort_index(axis=1)
-                )
-                st.markdown("#### Correlation heatmap")
-                st.dataframe(
-                    kappa_matrix.style.format("{:.2f}"),
-                    use_container_width=True,
-                )
-
-        st.markdown("#### Fleiss kappa summary")
-        if fleiss.empty:
-            st.info("Unable to compute Fleiss kappa with the current selection.")
-        else:
-            st.dataframe(
-                fleiss.sort_values("concept")
-                .style.format({"fleiss_kappa": "{:.3f}", "n_items": "{:d}"}),
-                use_container_width=True,
-            )
-
-        st.markdown("#### Krippendorff alpha (nominal)")
-        if krippendorff.empty:
-            st.info("Krippendorff alpha requires at least two annotations per note/concept.")
-        else:
-            st.dataframe(
-                krippendorff.sort_values("concept")
-                .style.format(
-                    {
-                        "krippendorff_alpha": "{:.3f}",
-                        "n_items": "{:d}",
-                        "mean_raters": "{:.1f}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-    with llm_vs_gold_tab:
-        kpi_cols = st.columns(2)
-        kpi_cols[0].metric("Best LLM F1", format_metric(best_f1, "{:.2%}"))
-        kpi_cols[1].metric(
-            "Gold coverage",
-            format_metric(coverage, "{:.0%}"),
-            help="Proportion of note/concept pairs with a resolved gold label.",
-        )
-
-        if metrics.empty:
-            st.warning("No LLM predictions align with the current filters.")
-        else:
-            st.markdown("#### Concept-level metrics")
-            detail = (
-                metrics.groupby(["llm", "concept"])
-                .agg(
-                    f1=("f1", "mean"),
-                    precision=("precision", "mean"),
-                    recall=("recall", "mean"),
-                    specificity=("specificity", "mean"),
-                    support=("support", "sum"),
-                )
-                .reset_index()
-            )
-            st.dataframe(
-                detail.sort_values(["concept", "f1"], ascending=[True, False])
-                .style.format(
-                    {
-                        "f1": "{:.2f}",
-                        "precision": "{:.2f}",
-                        "recall": "{:.2f}",
-                        "specificity": "{:.2f}",
-                        "support": "{:d}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-            st.markdown("#### Pipeline comparison")
-            pipeline_summary = (
-                metrics.groupby(["llm", "pipeline"])
-                .agg(
-                    f1=("f1", "mean"),
-                    precision=("precision", "mean"),
-                    recall=("recall", "mean"),
-                    specificity=("specificity", "mean"),
-                    confidence=("confidence", "mean"),
-                    latency_ms=("latency_ms", "mean"),
-                    support=("support", "sum"),
-                )
-                .reset_index()
-            )
-            st.dataframe(
-                pipeline_summary.sort_values("f1", ascending=False)
-                .style.format(
-                    {
-                        "f1": "{:.2f}",
-                        "precision": "{:.2f}",
-                        "recall": "{:.2f}",
-                        "specificity": "{:.2f}",
-                        "confidence": "{:.2f}",
-                        "latency_ms": "{:.0f}",
-                        "support": "{:d}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-            st.markdown("#### Error distribution")
-            error_summary = (
-                metrics.groupby("llm")[['tp', 'tn', 'fp', 'fn']]
-                .sum()
-                .reset_index()
-            )
-            st.dataframe(error_summary, use_container_width=True)
-
-            if {"confidence"}.issubset(set(llm_df.columns)):
-                filtered_predictions = llm_df.filter(
-                    pl.col("llm").is_in(llm_filter)
-                    & pl.col("pipeline").is_in(pipeline_filter)
-                    & pl.col("concept").is_in(concept_filter)
-                )
-                if not filtered_predictions.is_empty():
-                    preds_pd = filtered_predictions.to_pandas()
-                    if "confidence" in preds_pd.columns:
-                        preds_pd = preds_pd.dropna(subset=["confidence"])
-                        if not preds_pd.empty:
-                            preds_pd["confidence_bucket"] = pd.cut(
-                                preds_pd["confidence"],
-                                bins=[0.0, 0.5, 0.7, 0.85, 1.0],
-                                labels=[
-                                    "0.00-0.50",
-                                    "0.51-0.70",
-                                    "0.71-0.85",
-                                    ">0.85",
-                                ],
-                                include_lowest=True,
-                            )
-                            distribution = (
-                                preds_pd.groupby(["confidence_bucket", "llm"])
-                                .size()
-                                .unstack(fill_value=0)
-                            )
-                            st.markdown("#### Confidence distribution")
-                            st.bar_chart(distribution)
-
-    with llm_vs_llm_tab:
-        if metrics.empty:
-            st.warning("No LLM predictions align with the current filters.")
-        else:
-            st.markdown("#### Leaderboard (mean scores across selections)")
-            combo_summary = (
-                metrics.groupby(["pipeline", "llm"])
-                .agg(
-                    f1=("f1", "mean"),
-                    precision=("precision", "mean"),
-                    recall=("recall", "mean"),
-                    specificity=("specificity", "mean"),
-                    support=("support", "sum"),
-                )
-                .reset_index()
-            )
-            combo_summary["combo"] = (
-                combo_summary["pipeline"] + " | " + combo_summary["llm"]
-            )
-            st.dataframe(
-                combo_summary.sort_values("f1", ascending=False)
-                .style.format(
-                    {
-                        "f1": "{:.2f}",
-                        "precision": "{:.2f}",
-                        "recall": "{:.2f}",
-                        "specificity": "{:.2f}",
-                        "support": "{:d}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-            if not combo_summary.empty:
-                score_series = (
-                    combo_summary.set_index("combo")["f1"]
-                    .fillna(0.0)
-                    .sort_values(ascending=False)
-                )
-                if not score_series.empty:
-                    score_values = score_series.to_numpy()
-                    diff_matrix = score_values[:, None] - score_values[None, :]
-                    diff_df = pd.DataFrame(
-                        diff_matrix,
-                        index=score_series.index,
-                        columns=score_series.index,
-                    )
-                    st.markdown("#### Pairwise delta F1 matrix")
-                    st.dataframe(
-                        diff_df.style.format("{:+.2f}"),
-                        use_container_width=True,
-                    )
-
-            concept_matrix = pd.pivot_table(
-                metrics,
-                index="concept",
-                columns="pipeline",
-                values="f1",
-                aggfunc="mean",
-            )
-            if not concept_matrix.empty:
-                st.markdown("#### Concept coverage by pipeline (mean F1)")
-                st.dataframe(
-                    concept_matrix.sort_index().style.format("{:.2f}"),
-                    use_container_width=True,
-                )
-
-    with runner_tab:
-        st.markdown("#### Run an LLM pipeline on a test set")
-        st.caption(
-            "Provide a dataset path (Parquet or CSV with the expected text columns), "
-            "select a pipeline, and the app will process the file in batches."
-        )
-
-        dataset_path = st.text_input("Test dataset path", key="eval_test_path")
-        dataset_format = st.selectbox(
-            "Dataset format",
-            options=["parquet", "csv"],
-            key="eval_test_format",
-        )
-        batch_size = st.number_input(
-            "Batch size",
-            min_value=1,
-            max_value=512,
-            step=1,
-            key="eval_test_batch_size",
-        )
-        pipeline_catalog = load_pipelines_from_db()
-        pipeline_names = [p["name"] for p in pipeline_catalog]
-        pipeline_choice = None
-        if pipeline_names:
-            if state["eval_test_pipeline"] not in pipeline_names:
-                state["eval_test_pipeline"] = pipeline_names[0]
-            pipeline_choice = st.selectbox(
-                "Pipeline to run",
-                options=pipeline_names,
-                key="eval_test_pipeline",
-            )
-        else:
-            st.warning("Create at least one pipeline in the configuration tab.")
-
-        action_cols = st.columns(2)
-        preview_clicked = action_cols[0].button("Preview dataset", use_container_width=True)
-        run_clicked = action_cols[1].button(
-            "Run pipeline (batched)",
-            type="primary",
-            use_container_width=True,
-        )
-
-        if preview_clicked:
-            if not dataset_path:
-                st.error("Provide a dataset path before requesting a preview.")
-            else:
-                try:
-                    lazy_dataset = load_lazy_dataset(dataset_path, dataset_format)
-                    preview_rows = lazy_dataset.head(min(int(batch_size), 5)).collect()
-                except Exception as exc:
-                    st.error(f"Failed to load dataset preview: {exc}")
+def compute_fleiss_kappa_per_concept(dfs, id_col, concept_cols):
+    """
+    Compute Fleiss' Kappa for multiple annotators for each medical concept.
+    Returns dict of {concept: kappa_score}
+    """
+    if len(dfs) < 2:
+        return {}
+    
+    kappa_scores = {}
+    
+    for concept in concept_cols:
+        # Get all IDs that appear in all dataframes
+        common_ids = set(dfs[0][id_col].unique().to_list())
+        for df in dfs[1:]:
+            common_ids = common_ids.intersection(set(df[id_col].unique().to_list()))
+        
+        if len(common_ids) == 0:
+            continue
+        
+        common_ids = sorted(list(common_ids))
+        
+        # Build rating matrix
+        rating_matrix = []
+        n_annotators = len(dfs)
+        
+        for report_id in common_ids:
+            # Get annotations from all annotators for this report
+            annotations = []
+            for df in dfs:
+                report_data = df.filter(pl.col(id_col) == report_id)
+                if report_data.height > 0 and concept in report_data.columns:
+                    annotations.append(int(report_data[concept][0]))
                 else:
-                    if preview_rows.is_empty():
-                        st.info("Dataset loaded but returned no rows.")
-                    else:
-                        st.dataframe(preview_rows, use_container_width=True)
+                    annotations.append(None)
+            
+            # Only include if all annotators have annotated
+            if None not in annotations:
+                # Count 0s and 1s
+                count_0 = annotations.count(0)
+                count_1 = annotations.count(1)
+                rating_matrix.append([count_0, count_1])
+        
+        if len(rating_matrix) == 0:
+            continue
+        
+        N = len(rating_matrix)  # number of subjects (reports)
+        n = n_annotators
+        
+        # Calculate P_i
+        P_values = []
+        for row in rating_matrix:
+            sum_sq = sum(x**2 for x in row)
+            P_i = (sum_sq - n) / (n * (n - 1))
+            P_values.append(P_i)
+        
+        P_bar = sum(P_values) / N
+        
+        # Calculate P_e
+        p_0 = sum(rating_matrix[i][0] for i in range(N)) / (N * n)
+        p_1 = sum(rating_matrix[i][1] for i in range(N)) / (N * n)
+        
+        P_e = p_0**2 + p_1**2
+        
+        # Fleiss' Kappa
+        if P_e == 1:
+            kappa = 1.0
+        else:
+            kappa = (P_bar - P_e) / (1 - P_e)
+        
+        kappa_scores[concept] = kappa
+    
+    return kappa_scores
 
-        if run_clicked:
-            if not dataset_path:
-                st.error("Provide a dataset path before running the pipeline.")
-            elif pipeline_choice is None:
-                st.error("Select a pipeline to run.")
-            else:
+def plot_pairwise_agreement(annotations_db, id_col, concept_cols):
+    """Create heatmap of average pairwise Cohen's Kappa scores across all concepts"""
+    n = len(annotations_db)
+    if n < 2:
+        return None
+    
+    avg_kappa_matrix = [[0.0 for _ in range(n)] for _ in range(n)]
+    count_matrix = [[0 for _ in range(n)] for _ in range(n)]
+    
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                avg_kappa_matrix[i][j] = 1.0
+                count_matrix[i][j] = annotations_db[i]['data'].height
+            elif i < j:
+                kappa_dict, count = compute_cohen_kappa_per_concept(
+                    annotations_db[i]['data'],
+                    annotations_db[j]['data'],
+                    id_col,
+                    concept_cols
+                )
+                if kappa_dict:
+                    avg_kappa = sum(kappa_dict.values()) / len(kappa_dict)
+                    avg_kappa_matrix[i][j] = avg_kappa
+                    avg_kappa_matrix[j][i] = avg_kappa
+                    count_matrix[i][j] = count
+                    count_matrix[j][i] = count
+    
+    labels = [f"Ann{i+1}: {ann['filename'][:20]}" for i, ann in enumerate(annotations_db)]
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=avg_kappa_matrix,
+        x=labels,
+        y=labels,
+        colorscale='RdYlGn',
+        zmid=0.5,
+        text=[[f"κ={avg_kappa_matrix[i][j]:.3f}<br>n={count_matrix[i][j]}" 
+               for j in range(n)] for i in range(n)],
+        texttemplate='%{text}',
+        textfont={"size": 10},
+        colorbar=dict(title="Avg Cohen's Kappa")
+    ))
+    
+    fig.update_layout(
+        title="Pairwise Inter-Annotator Agreement (Average Cohen's Kappa)",
+        xaxis_title="Annotator",
+        yaxis_title="Annotator",
+        height=600
+    )
+    
+    return fig
+
+
+def compute_gold_standard_dataset(
+    annotations: list[dict],
+    id_col: str | None,
+    concept_cols: list[str],
+    text_col: str | None = None,
+) -> pl.DataFrame:
+    """Build a consensus dataset via majority voting across annotators."""
+    if not annotations or not id_col or not concept_cols:
+        return pl.DataFrame()
+
+    vote_cache: dict = defaultdict(lambda: defaultdict(list))
+    text_cache: dict = {}
+
+    for ann in annotations:
+        df = ann["data"]
+        if id_col not in df.columns:
+            continue
+
+        present_concepts = [col for col in concept_cols if col in df.columns]
+        if not present_concepts:
+            continue
+
+        select_cols = [id_col] + present_concepts
+        include_text = text_col and text_col in df.columns
+        if include_text:
+            select_cols.append(text_col)
+
+        rows = df.select(select_cols).to_dicts()
+        for row in rows:
+            record_id = row.get(id_col)
+            if record_id is None:
+                continue
+
+            if include_text and record_id not in text_cache:
+                text_value = row.get(text_col)
+                if text_value is not None:
+                    text_cache[record_id] = text_value
+
+            for concept in present_concepts:
+                value = row.get(concept)
+                if value is None:
+                    continue
                 try:
-                    lazy_dataset = load_lazy_dataset(dataset_path, dataset_format)
-                except Exception as exc:
-                    st.error(f"Unable to load dataset: {exc}")
-                else:
-                    pipeline_cfg = build_pipeline_runtime_config(pipeline_choice)
-                    if pipeline_cfg is None:
-                        st.error("The selected pipeline is missing its primary model or prompts.")
-                    else:
-                        progress_bar = st.progress(0.0)
+                    vote_cache[record_id][concept].append(int(value))
+                except (TypeError, ValueError):
+                    continue
 
-                        def _progress_callback(done: int, total: int) -> None:
-                            progress_bar.progress(min(done / max(total, 1), 1.0))
+    records: list[dict] = []
+    for record_id, concept_votes in vote_cache.items():
+        entry = {id_col: record_id}
+        if text_col:
+            entry[text_col] = text_cache.get(record_id)
+        has_label = False
 
-                        try:
-                            with st.spinner("Running the LLM pipeline over the test set..."):
-                                results = run_pipeline_batches(
-                                    lazy_dataset,
-                                    pipeline_cfg,
-                                    int(batch_size),
-                                    progress_callback=_progress_callback,
-                                )
-                        except Exception as exc:
-                            st.error(f"Pipeline execution failed: {exc}")
-                        else:
-                            if results.is_empty():
-                                st.warning("Pipeline completed but produced no outputs.")
-                            else:
-                                state.eval_test_results = results
-                                st.success(
-                                    f"Pipeline run completed over {results.height} records."
-                                )
-                        finally:
-                            progress_bar.empty()
+        for concept in concept_cols:
+            votes = concept_votes.get(concept, [])
+            if votes:
+                positives = sum(1 for vote in votes if vote == 1)
+                negatives = len(votes) - positives
+                entry[concept] = 1 if positives >= negatives else 0
+                has_label = True
+            else:
+                entry[concept] = None
 
-        latest_results = state.get("eval_test_results")
-        if isinstance(latest_results, pl.DataFrame) and not latest_results.is_empty():
-            st.markdown("#### Latest batch run preview")
-            st.dataframe(
-                latest_results.head(50),
-                use_container_width=True,
+        if has_label:
+            records.append(entry)
+
+    return pl.DataFrame(records) if records else pl.DataFrame()
+
+
+def derive_annotation_columns(annotations: list[dict]) -> tuple[str | None, list[str]]:
+    """Infer the ID column and concept columns from the first annotation table."""
+    if not annotations:
+        return None, []
+
+    sample_df = annotations[0]["data"]
+    columns = sample_df.columns
+    id_col = next((col for col in columns if "id" in col.lower()), None)
+
+    excluded = {"id", "report_text", "text", "report"}
+    concept_cols = [
+        col
+        for col in columns
+        if col.lower() not in excluded and col != id_col
+    ]
+    return id_col, concept_cols
+
+
+def detect_report_text_column(annotations: list[dict]) -> str | None:
+    """Identify a report text column if one exists."""
+    if not annotations:
+        return None
+
+    columns = annotations[0]["data"].columns
+    preferred = ["report_text", "text", "report"]
+    for candidate in preferred:
+        if candidate in columns:
+            return candidate
+
+    for column in columns:
+        if "text" in column.lower():
+            return column
+
+    return None
+
+
+def render_annotations_sidebar(annotations: list[dict]) -> tuple[str | None, list[str]]:
+    """Show database summary metrics and return inferred column metadata."""
+    id_col, concept_cols = derive_annotation_columns(annotations)
+
+    with st.sidebar:
+        st.subheader("Database Summary")
+        st.metric("Total Annotations", len(annotations))
+        if annotations:
+            total_reports = sum(ann["n_rows"] for ann in annotations)
+            st.metric("Total Reports", total_reports)
+            st.metric("Medical Concepts", len(concept_cols))
+        else:
+            st.info("Upload annotation CSV files to populate the evaluation database.")
+
+    return id_col, concept_cols
+
+
+def render_annotations_management_tab() -> None:
+    """Uploader, preview, and CRUD controls for annotation files."""
+    uploaded_files = st.file_uploader(
+        "Upload CSV annotation files",
+        type=["csv"],
+        accept_multiple_files=True,
+        help="Upload one or more CSV files containing medical concept annotations",
+    )
+    st.divider()
+
+    if uploaded_files:
+        st.markdown("##### Preview Uploaded Files")
+        for uploaded_file in uploaded_files:
+            with st.expander(f"File: {uploaded_file.name}"):
+                df = load_csv_file(uploaded_file)
+                if df is None:
+                    continue
+
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col1:
+                    st.dataframe(df.head(10), use_container_width=True)
+                with col2:
+                    st.metric("Rows", df.height)
+                    st.metric("Columns", df.width)
+                with col3:
+                    if st.button(
+                        "Save to Database", key=f"save_{uploaded_file.name}"
+                    ):
+                        save_annotation_to_db(df, uploaded_file.name)
+                        st.success(f"Saved {uploaded_file.name}")
+                        st.rerun()
+
+    st.markdown("##### Preview Annotations Database")
+    annotations = st.session_state.annotations_db
+
+    if not annotations:
+        st.info("No annotations saved yet. Upload files above to build the evaluation set.")
+        return
+
+    for ann in annotations:
+        with st.expander(f"{ann['filename']} (ID: {ann['id']})"):
+            col1, col2, col3 = st.columns([2, 1, 1])
+
+            with col1:
+                st.write(f"**Uploaded:** {ann['timestamp']}")
+                st.write(f"**Rows:** {ann['n_rows']} | **Columns:** {ann['n_cols']}")
+
+            with col2:
+                csv_buffer = BytesIO()
+                ann["data"].write_csv(csv_buffer)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv_buffer.getvalue(),
+                    file_name=ann["filename"],
+                    mime="text/csv",
+                    key=f"download_{ann['id']}",
+                )
+
+            with col3:
+                if st.button("Delete", key=f"delete_{ann['id']}", type="secondary"):
+                    delete_annotation(ann["id"])
+                    st.success(f"Deleted {ann['filename']}")
+                    st.rerun()
+
+            st.dataframe(ann["data"].head(20), use_container_width=True)
+
+    if st.button("Clear All Annotations", type="primary"):
+        clear_all_annotations()
+        st.success("All annotations cleared!")
+        st.rerun()
+
+
+def render_inter_annotator_analysis_tab(
+    id_col: str | None, concept_cols: list[str]
+) -> None:
+    """Visualizations and agreement metrics for saved annotations."""
+    st.header("Inter-Annotator Agreement Analysis")
+    annotations = st.session_state.annotations_db
+
+    if len(annotations) < 2:
+        st.warning("Upload and save at least two annotation files to compare agreement.")
+        return
+
+    if not id_col:
+        st.error("Could not auto-detect an ID column. Ensure one column contains 'id'.")
+        return
+
+    sample_df = annotations[0]["data"]
+    missing_concepts = [col for col in concept_cols if col not in sample_df.columns]
+    valid_concepts = [col for col in concept_cols if col in sample_df.columns]
+
+    if missing_concepts:
+        st.warning(f"Some concept columns were not found: {', '.join(missing_concepts)}")
+
+    if not valid_concepts:
+        st.error("No valid concept columns detected. Update the source data or column rules.")
+        return
+
+    st.subheader("Overall Agreement Metrics")
+
+    dfs = [ann["data"] for ann in annotations]
+    fleiss_scores = compute_fleiss_kappa_per_concept(dfs, id_col, valid_concepts)
+
+    if fleiss_scores:
+        avg_fleiss = sum(fleiss_scores.values()) / len(fleiss_scores)
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.metric(
+                "Average Fleiss' Kappa",
+                f"{avg_fleiss:.3f}",
+                help="Average agreement across all concepts and annotators",
             )
-            results_csv = latest_results.to_pandas().to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download latest results (CSV)",
-                data=results_csv,
-                file_name="llm_pipeline_results.csv",
-                mime="text/csv",
+
+            if avg_fleiss < 0:
+                interpretation = "Poor (Less than chance)"
+            elif avg_fleiss < 0.20:
+                interpretation = "Slight"
+            elif avg_fleiss < 0.40:
+                interpretation = "Fair"
+            elif avg_fleiss < 0.60:
+                interpretation = "Moderate"
+            elif avg_fleiss < 0.80:
+                interpretation = "Substantial"
+            else:
+                interpretation = "Almost Perfect"
+
+            st.info(f"Interpretation: **{interpretation}**")
+
+        with col2:
+            n = len(annotations)
+            all_kappa_scores: list[float] = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    kappa_dict, _ = compute_cohen_kappa_per_concept(
+                        annotations[i]["data"],
+                        annotations[j]["data"],
+                        id_col,
+                        valid_concepts,
+                    )
+                    if kappa_dict:
+                        all_kappa_scores.extend(kappa_dict.values())
+
+            if all_kappa_scores:
+                avg_pairwise = sum(all_kappa_scores) / len(all_kappa_scores)
+                st.metric(
+                    "Average Pairwise Cohen's Kappa",
+                    f"{avg_pairwise:.3f}",
+                    help="Mean of all pairwise agreements across all concepts",
+                )
+                st.metric("Number of Comparisons", len(all_kappa_scores))
+
+        st.divider()
+        st.subheader("Agreement by Medical Concept (Fleiss' Kappa)")
+
+        concept_df = pl.DataFrame(
+            [
+                {"Medical Concept": concept, "Fleiss' Kappa": round(score, 3)}
+                for concept, score in fleiss_scores.items()
+            ]
+        )
+        st.dataframe(concept_df, use_container_width=True, hide_index=True)
+
+        fig_fleiss = px.bar(
+            concept_df.to_pandas(),
+            x="Medical Concept",
+            y="Fleiss' Kappa",
+            title="Agreement per Concept",
+        )
+        fig_fleiss.add_hline(y=0.6, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig_fleiss, use_container_width=True)
+
+    st.subheader("Pairwise Agreement Matrix")
+    fig = plot_pairwise_agreement(annotations, id_col, valid_concepts)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("Detailed Pairwise Agreement (Cohen's Kappa)")
+
+    ann1_idx = st.selectbox(
+        "Select Annotator 1",
+        range(len(annotations)),
+        format_func=lambda i: annotations[i]["filename"],
+    )
+    ann2_idx = st.selectbox(
+        "Select Annotator 2",
+        range(len(annotations)),
+        format_func=lambda i: annotations[i]["filename"],
+        index=1 if len(annotations) > 1 else 0,
+    )
+
+    if ann1_idx == ann2_idx:
+        st.info("Select two different annotators to compare detailed pairwise metrics.")
+    else:
+        kappa_dict, n_common = compute_cohen_kappa_per_concept(
+            annotations[ann1_idx]["data"],
+            annotations[ann2_idx]["data"],
+            id_col,
+            valid_concepts,
+        )
+
+        if kappa_dict:
+            st.info(f"Comparing {n_common} common reports.")
+            pairwise_scores = [
+                {"Medical Concept": concept, "Cohen's Kappa": round(kappa, 3)}
+                for concept, kappa in sorted(
+                    kappa_dict.items(), key=lambda item: item[1], reverse=True
+                )
+            ]
+            pairwise_df = pl.DataFrame(pairwise_scores)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.dataframe(pairwise_df, use_container_width=True, hide_index=True)
+            with col2:
+                fig_pair = px.bar(
+                    pairwise_df.to_pandas(),
+                    x="Medical Concept",
+                    y="Cohen's Kappa",
+                    title="Agreement per Concept",
+                )
+                fig_pair.add_hline(y=0.6, line_dash="dash", line_color="gray")
+                st.plotly_chart(fig_pair, use_container_width=True)
+        else:
+            st.warning("No common reports were found between the selected annotators.")
+
+    st.divider()
+    st.subheader("Annotation Distribution by Concept")
+
+    dist_data = []
+    for ann in annotations:
+        for concept in valid_concepts:
+            if concept in ann["data"].columns:
+                positive = ann["data"][concept].sum()
+                total = ann["data"].height
+                dist_data.append(
+                    {
+                        "Annotator": ann["filename"],
+                        "Concept": concept,
+                        "Positive (1)": positive,
+                        "Negative (0)": total - positive,
+                        "Prevalence %": round((positive / total * 100), 1)
+                        if total > 0
+                        else 0,
+                    }
+                )
+
+    if dist_data:
+        dist_df = pl.DataFrame(dist_data)
+        fig_dist = go.Figure()
+        for annotator in dist_df["Annotator"].unique():
+            annotator_data = dist_df.filter(pl.col("Annotator") == annotator)
+            fig_dist.add_trace(
+                go.Bar(
+                    name=annotator,
+                    x=annotator_data["Concept"].to_list(),
+                    y=annotator_data["Prevalence %"].to_list(),
+                    text=annotator_data["Prevalence %"].to_list(),
+                    texttemplate="%{text}%",
+                    textposition="auto",
+                )
             )
+
+        fig_dist.update_layout(
+            title="Positive Annotation Rate by Concept and Annotator",
+            xaxis_title="Medical Concept",
+            yaxis_title="Prevalence (%)",
+            barmode="group",
+            height=500,
+        )
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+        with st.expander("Detailed Distribution Table"):
+            st.dataframe(dist_df, use_container_width=True, hide_index=True)
+
+
+def render_gold_standard_tab(id_col: str | None, concept_cols: list[str]) -> None:
+    """Display consensus dataset and provide a mock evaluation workflow."""
+   
+    annotations = st.session_state.annotations_db
+
+    if not annotations:
+        st.info("Upload annotations to build the gold standard dataset.")
+        return
+
+    if not id_col or not concept_cols:
+        st.warning("Unable to infer ID or concept columns from the annotations.")
+        return
+
+    text_col = detect_report_text_column(annotations)
+    gold_df = compute_gold_standard_dataset(
+        annotations, id_col, concept_cols, text_col=text_col
+    )
+    if gold_df.is_empty():
+        st.warning("Could not compute a gold standard dataset from the current annotations.")
+        return
+    col1, col2, col3 = st.columns([0.6, 0.2, 0.2])
+    col2.metric("Gold Standard Records", gold_df.height)
+    col3.metric("Concept Columns", len(concept_cols))
+
+    if text_col:
+        st.caption(f"Including report text column: `{text_col}`")
+
+    with st.expander("View Gold Standard Dataset"):
+        st.dataframe(gold_df, use_container_width=True, hide_index=True)
+
+    csv_buffer = BytesIO()
+    gold_df.write_csv(csv_buffer)
+    st.download_button(
+        label="Download Gold Standard CSV",
+        data=csv_buffer.getvalue(),
+        file_name="gold_standard.csv",
+        mime="text/csv",
+    )
+
+    train_pct = st.slider("Training Split (%)", min_value=50, max_value=95, value=80, step=5)
+    total_rows = gold_df.height
+    train_rows = max(0, int(total_rows * train_pct / 100))
+    test_rows = total_rows - train_rows
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Training Records", train_rows)
+    with col2:
+        st.metric("Testing Records", test_rows)
+
+    pipelines = load_pipelines_from_db()
+    selected_pipeline_id = None
+    pipeline_name_lookup: dict[int, str] = {}
+
+    if pipelines:
+        pipeline_name_lookup = {
+            pipeline["id"]: pipeline["name"] or f"Pipeline #{pipeline['id']}"
+            for pipeline in pipelines
+        }
+        selected_pipeline_id = st.selectbox(
+            "Select Pipeline to Evaluate",
+            options=list(pipeline_name_lookup.keys()),
+            format_func=lambda pid: pipeline_name_lookup[pid],
+        )
+    else:
+        st.info("No pipelines available. Configure one in the Pipeline Configuration tab.")
+
+    if st.button("Run Visual Evaluation"):
+        if total_rows == 0:
+            st.warning("Gold standard dataset is empty.")
+        elif not pipeline_name_lookup:
+            st.warning("Create a pipeline before running the evaluation.")
+        else:
+            pipeline_name = pipeline_name_lookup[selected_pipeline_id]
+            progress = st.progress(0)
+            status_placeholder = st.empty()
+
+            with st.spinner(f"Simulating evaluation for {pipeline_name}"):
+                for pct in range(0, 101, 20):
+                    time.sleep(0.2)
+                    progress.progress(pct)
+                    status_placeholder.info(
+                        f"Evaluating {pipeline_name} on {train_rows} train / {test_rows} test records..."
+                    )
+
+            progress.empty()
+            status_placeholder.empty()
+            st.success(f"Visual evaluation completed for {pipeline_name}.")
+            st.caption(
+                f"Train/Test split: {train_rows} / {test_rows} records using a {train_pct}% split."
+            )
+
+
+def render_pipeline_evaluation_tab() -> None:
+    """Orchestrate sidebar, management, and analysis sections."""
+    annotations = st.session_state.annotations_db
+    id_col, concept_cols = render_annotations_sidebar(annotations)
+    tab1, tab2, tab3 = st.tabs(
+        ["Annotations Management", "Inter-Annotator Analysis", "Gold Standard Evaluation"]
+    )
+    with tab1:
+        render_annotations_management_tab()
+    with tab2:
+        render_inter_annotator_analysis_tab(id_col, concept_cols)
+    with tab3:
+        render_gold_standard_tab(id_col, concept_cols)
+
 
 def main() -> None:
     ensure_session_state()
     sanitize_pipeline_state()
 
-    tabs = st.tabs(["Pipeline Configuration", "Pipeline Unit Test", " Pipeline Evaluation"])
+    tabs = st.tabs(["Pipeline Configuration", "Pipeline Unit Test", "Pipeline Evaluation"])
     with tabs[0]:
         pip_tabs = st.tabs(["Models", "Prompts", "Pipeline"])
         with pip_tabs[0]:
@@ -2307,8 +2353,8 @@ def main() -> None:
             render_prompts_tab()
         with pip_tabs[2]:
             render_pipeline_tab()
-    with tabs[1] :
-        ut_tabs = st.tabs(["Report Selection","Extraction", "Raw Output"])
+    with tabs[1]:
+        ut_tabs = st.tabs(["Report Selection", "Extraction", "Raw Output"])
         with ut_tabs[0]:
             render_reports_selection()
         with ut_tabs[1]:
@@ -2317,9 +2363,6 @@ def main() -> None:
             render_raw_output()
     with tabs[2]:
         render_pipeline_evaluation_tab()
-
-        
-    
 
 if __name__ == "__main__":
     main()
