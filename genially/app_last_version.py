@@ -18,6 +18,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 from initialize_pipeline_db import DB_FILENAME, SCHEMA, ensure_database
 from display_text import display, highlight_contexts, configure_aggrid
 from llm_extractor_pipeline import build_messages, llm_extractor
+from evaluation_pipeline import run_pipeline_prediction, compute_concept_metrics
 
 st.set_page_config(page_title="LLM-Based Medical Concept Extraction", layout="wide")
 
@@ -604,6 +605,10 @@ def ensure_session_state() -> None:
         state.pipelines_loaded = True
     if "pipeline_form_name" not in state:
         reset_pipeline_form_fields(state)
+    if "gold_eval_result" not in state:
+        state.gold_eval_result = None
+    if "gold_eval_error" not in state:
+        state.gold_eval_error = ""
 
 
 def sanitize_pipeline_state() -> None:
@@ -953,6 +958,49 @@ def map_pipeline_keys(pipeline: dict) -> dict:
     }
 
 
+def hydrate_pipeline_runtime(pipeline: dict) -> dict:
+    """Attach prompt/model metadata for execution time."""
+    sanitized = map_pipeline_keys(pipeline)
+    models_by_id = {model["id"]: model for model in load_models_from_db()}
+    prompts_by_id = {prompt["id"]: prompt for prompt in load_prompts_from_db()}
+
+    model_confs = [
+        models_by_id[mid]
+        for mid in sanitized["selected_models"]
+        if mid in models_by_id
+    ]
+
+    anti = sanitized["anti_hallucination"]
+    anti_config = {
+        "ensemble": bool(anti.get("ensemble")),
+        "ensemble_size": int(
+            anti.get("ensemble_size", anti.get("ensembleSize", PIPELINE_DEFAULTS["ensemble_size"]))
+            or PIPELINE_DEFAULTS["ensemble_size"]
+        ),
+        "chain_of_verification": bool(anti.get("chain_of_verification")),
+        "contextual_grounding": bool(anti.get("contextual_grounding")),
+        "llm_as_judge": bool(anti.get("llm_as_judge")),
+        "judge_model": anti.get("judge_model"),
+    }
+
+    system_prompt = prompts_by_id.get(sanitized["technical_prompt"], {}).get("content")
+    user_prompt = prompts_by_id.get(sanitized["clinical_prompt"], {}).get("content")
+    judge_conf = None
+    judge_id = anti_config.get("judge_model")
+    if judge_id in models_by_id:
+        judge_conf = models_by_id[judge_id]
+
+    return {
+        "id": sanitized["id"],
+        "name": sanitized["name"],
+        "models": model_confs,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "anti": anti_config,
+        "judge_model": judge_conf,
+    }
+
+
 def save_pipeline_form() -> None:
     state = st.session_state
     pipeline = collect_pipeline_form_data()
@@ -1169,7 +1217,7 @@ def render_raw_output()-> None:
         st.warning("Aucune tentative d'extraction")
     
 def get_available_models() :
-    response = requests.get("http://lx181.intra.chu-rennes.fr:11434/api/tags")
+    response = requests.get("http://localhost:11435/api/tags")
     data = response.json()
     model_names = [model["name"] for model in data.get("models", [])]
     return model_names
@@ -2271,7 +2319,7 @@ def render_gold_standard_tab(id_col: str | None, concept_cols: list[str]) -> Non
         mime="text/csv",
     )
 
-    train_pct = st.slider("Training Split (%)", min_value=50, max_value=95, value=80, step=5)
+    train_pct = st.slider("Training Split (%)", min_value=10, max_value=95, value=80, step=5)
     total_rows = gold_df.height
     train_rows = max(0, int(total_rows * train_pct / 100))
     test_rows = total_rows - train_rows
@@ -2304,25 +2352,112 @@ def render_gold_standard_tab(id_col: str | None, concept_cols: list[str]) -> Non
             st.warning("Gold standard dataset is empty.")
         elif not pipeline_name_lookup:
             st.warning("Create a pipeline before running the evaluation.")
+        elif not text_col:
+            st.error("Gold standard dataset does not contain a report/text column.")
+        elif not concept_cols:
+            st.error("No concept columns detected for evaluation.")
         else:
-            pipeline_name = pipeline_name_lookup[selected_pipeline_id]
-            progress = st.progress(0)
-            status_placeholder = st.empty()
-
-            with st.spinner(f"Simulating evaluation for {pipeline_name}"):
-                for pct in range(0, 101, 20):
-                    time.sleep(0.2)
-                    progress.progress(pct)
-                    status_placeholder.info(
-                        f"Evaluating {pipeline_name} on {train_rows} train / {test_rows} test records..."
-                    )
-
-            progress.empty()
-            status_placeholder.empty()
-            st.success(f"Visual evaluation completed for {pipeline_name}.")
-            st.caption(
-                f"Train/Test split: {train_rows} / {test_rows} records using a {train_pct}% split."
+            pipeline_record = next(
+                (p for p in pipelines if p["id"] == selected_pipeline_id), None
             )
+            if pipeline_record is None:
+                st.error("Unable to load the selected pipeline.")
+            else:
+                runtime = hydrate_pipeline_runtime(pipeline_record)
+                if not runtime["models"]:
+                    st.error("The selected pipeline has no valid models configured.")
+                else:
+                    gold_pdf = gold_df.to_pandas().head(train_rows)
+                    pipeline_name = pipeline_name_lookup[selected_pipeline_id]
+                    st.session_state.gold_eval_error = ""
+                    with st.spinner(f"Running evaluation with {pipeline_name}"):
+                        try:
+                            eval_outputs = run_pipeline_prediction(
+                                gold_pdf.head(),
+                                id_col=id_col,
+                                text_col=text_col,
+                                concept_cols=concept_cols,
+                                model_confs=runtime["models"],
+                                system_prompt=runtime["system_prompt"],
+                                user_prompt=runtime["user_prompt"],
+                                anti=runtime["anti"],
+                                judge_conf=runtime["judge_model"],
+                                max_concurrency=min(4, max(1, total_rows)),
+                            )
+                            metrics_df, summary = compute_concept_metrics(
+                                gold_pdf, eval_outputs["aggregated"], concept_cols, id_col
+                            )
+                            per_model_payload = [
+                                {
+                                    "label": runtime["models"][idx].get("name")
+                                    or runtime["models"][idx].get("model"),
+                                    "data": model_df,
+                                }
+                                for idx, model_df in enumerate(eval_outputs["per_model"])
+                            ]
+                            st.session_state.gold_eval_result = {
+                                "pipeline_name": pipeline_name,
+                                "timestamp": datetime.now().isoformat(),
+                                "predictions": eval_outputs["aggregated"],
+                                "per_model": per_model_payload,
+                                "judge": eval_outputs["judge"],
+                                "metrics": metrics_df,
+                                "summary": summary,
+                                "train_split": train_rows,
+                                "test_split": test_rows,
+                                "train_pct": train_pct,
+                            }
+                        except Exception as exc:
+                            st.session_state.gold_eval_error = str(exc)
+                            st.session_state.gold_eval_result = None
+
+    if st.session_state.gold_eval_error:
+        st.error(f"Evaluation failed: {st.session_state.gold_eval_error}")
+
+    result_payload = st.session_state.gold_eval_result
+    if result_payload:
+        st.subheader("Latest Pipeline Evaluation")
+        summary = result_payload["summary"]
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Precision", f"{summary['precision']:.2%}")
+        metric_cols[1].metric("Recall", f"{summary['recall']:.2%}")
+        metric_cols[2].metric("F1", f"{summary['f1']:.2%}")
+        metric_cols[3].metric("Accuracy", f"{summary['accuracy']:.2%}")
+        st.caption(
+            f"{result_payload['pipeline_name']} · "
+            f"{result_payload['train_split']} train / {result_payload['test_split']} test "
+            f"({result_payload['train_pct']}% split)"
+        )
+
+        st.markdown("#### Per-Concept Metrics")
+        metrics_view = result_payload["metrics"].copy()
+        numeric_cols = ["precision", "recall", "f1", "accuracy"]
+        for col in numeric_cols:
+            if col in metrics_view.columns:
+                metrics_view[col] = metrics_view[col].apply(
+                    lambda v: f"{v:.2%}" if isinstance(v, (int, float)) else "—"
+                )
+        st.dataframe(metrics_view, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Predictions Preview")
+        prediction_df = result_payload["predictions"]
+        st.dataframe(prediction_df.head(50), use_container_width=True)
+        csv_bytes = prediction_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Predictions CSV",
+            data=csv_bytes,
+            file_name="pipeline_predictions.csv",
+            mime="text/csv",
+        )
+
+        with st.expander("Per-model outputs"):
+            for idx, payload in enumerate(result_payload["per_model"], start=1):
+                st.markdown(f"**Model {idx}: {payload['label']}**")
+                st.dataframe(payload["data"].head(20), use_container_width=True)
+
+        if result_payload["judge"] is not None:
+            with st.expander("Judge Model Output"):
+                st.dataframe(result_payload["judge"].head(20), use_container_width=True)
 
 
 def render_pipeline_evaluation_tab() -> None:
