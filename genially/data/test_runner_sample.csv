@@ -1,4 +1,0 @@
-patient_id,document_type,title,datetime,text,raw_text
-101,Discharge Summary,Stay summary,2024-10-01T10:00:00,Patient discharged with improved vitals. Continue ACE inhibitor and schedule cardiology follow-up in 2 weeks.,PATIENT DISCHARGED WITH IMPROVED VITALS. continue ace inhibitor. cardio follow up 2w.
-102,Radiology,CT Abdomen,2024-10-02T08:30:00,CT abdomen shows no acute process. Stable hepatic cysts. Recommend repeat imaging in 12 months.,ct ABD: no acute process. stable hepatic cysts. repeat imaging 12mo.
-103,Consult,Nephrology consult,2024-10-03T14:15:00,Nephrology consulted for rising creatinine. Suspect prerenal etiology; start IV fluids and monitor labs daily.,"nephro consult for inc creatinine. prerenal? start ivf, labs daily."
