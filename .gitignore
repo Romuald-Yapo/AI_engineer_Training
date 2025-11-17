@@ -1,0 +1,29 @@
+# --- Python build/cache files ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# --- Jupyter notebooks checkpoints ---
+.ipynb_checkpoints/
+
+# --- Environnements virtuels ---
+.venv/
+venv/
+.env/
+env/
+
+# --- Config et données locales ---
+.local/
+.cache/
+*.log
+*.tmp
+
+# --- Données volumineuses ou sensibles ---
+*.csv
+*.parquet
+*.feather
+*.tsv
+*.jsonl
+
