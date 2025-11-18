@@ -16,7 +16,6 @@ def load_model_ollama(model_name, num_ctx, max_output, temperature, top_p, top_k
         num_ctx=num_ctx,
         top_p=top_p,
         top_k=top_k,
-        base_url="http://lx181.intra.chu-rennes.fr:11434/",
     )  # Hyperparameters of the model
 
 
