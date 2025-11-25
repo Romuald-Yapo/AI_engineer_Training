@@ -8,11 +8,11 @@ easy to configure models, test prompts, highlight evidence in medical reports, a
 
 ## Highlights
 
-- 🏥 **Clinical report explorer** – browse synthetic hospital stays, toggle between raw/clean versions, and highlight contexts returned by LLMs (`display_text.py`).
-- 🤖 **Pipeline composer** – persist model settings, prompt versions, and anti-hallucination strategies inside a SQLite database (`initialize_pipeline_db.py`, `pipelines.db`).
-- 🧪 **Unit-test harness** – run extractions on-the-fly with ensembles, chain-of-verification and judge models (`llm_extractor_pipeline.py`) before promoting a pipeline.
-- 📊 **Evaluation lab** – upload multi-annotator labels, generate a gold standard, and compute per-concept metrics through `evaluation_pipeline.py`.
-- 🧷 **Reproducible demo data** – regenerate the full synthetic dataset (`synthetic_data/*.parquet`) and sample annotation CSV files to stress-test the UI.
+- **Clinical report explorer** – browse synthetic hospital stays, toggle between raw/clean versions, and highlight contexts returned by LLMs (`display_text.py`).
+- **Pipeline composer** – persist model settings, prompt versions, and anti-hallucination strategies inside a SQLite database (`initialize_pipeline_db.py`, `pipelines.db`).
+- **Unit-test harness** – run extractions on-the-fly with ensembles, chain-of-verification and judge models (`llm_extractor_pipeline.py`) before promoting a pipeline.
+- **Evaluation lab** – upload multi-annotator labels, generate a gold standard, and compute per-concept metrics through `evaluation_pipeline.py`.
+- **Reproducible demo data** – regenerate the full synthetic dataset (`synthetic_data/*.parquet`) and sample annotation CSV files to stress-test the UI.
 
 ---
 
